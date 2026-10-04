@@ -133,7 +133,7 @@ jobs:
       - name: Job summary
         run: |
           cat deployed/contract-ids.env
-          echo "## ✅ AtriumMind Contracts on Stellar Testnet" >> $GITHUB_STEP_SUMMARY
+          echo "## ✅ SynapsVault Contracts on Stellar Testnet" >> $GITHUB_STEP_SUMMARY
           echo "| Contract | ID |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| vault-registry | \`$VAULT_REGISTRY\` |" >> $GITHUB_STEP_SUMMARY

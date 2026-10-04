@@ -1,7 +1,7 @@
 #![no_std]
-//! AtriumMind — Subscription Manager (Soroban / Stellar)
+//! SynapsVault — Subscription Manager (Soroban / Stellar)
 //!
-//! Manages recurring 30-day subscription plans for AtriumMind publishers.
+//! Manages recurring 30-day subscription plans for SynapsVault publishers.
 //! Publishers create plans; the backend subscribes buyers after payment confirmation
 //! and renews each billing cycle. Subscribers can self-cancel with access until period end.
 

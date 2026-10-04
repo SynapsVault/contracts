@@ -1,9 +1,9 @@
 #![no_std]
-//! AtriumMind — Access Lease Contract (Soroban / Stellar)
+//! SynapsVault — Access Lease Contract (Soroban / Stellar)
 //!
 //! Issues time-limited on-chain access grants to vault resources.
 //! Any third party can verify a buyer's access via `is_valid` without
-//! trusting the AtriumMind backend — the Stellar ledger is the source of truth.
+//! trusting the SynapsVault backend — the Stellar ledger is the source of truth.
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String};
 

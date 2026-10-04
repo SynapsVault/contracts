@@ -1,4 +1,4 @@
-# Contributing to AtriumMind Contracts
+# Contributing to SynapsVault Contracts
 
 ## Prerequisites
 
