@@ -153,5 +153,5 @@ All persistent entries are bumped **90 days** on every write — actively manage
 
 ## License
 
-MIT © 2025 bolu26
+MIT © 2025 Busiii-adetiba
 # SynapsVault Contracts — deployed on Stellar testnet
