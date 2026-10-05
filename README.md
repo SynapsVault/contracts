@@ -2,7 +2,7 @@
   <h1>⬡ SynapsVault — Contracts</h1>
   <p><strong>Soroban smart contracts on the Stellar network</strong></p>
   <p>
-    <a href="https://github.com/SynapsVault/SynapsVault-contracts/actions"><img src="https://github.com/SynapsVault/SynapsVault-contracts/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+    <a href="https://github.com/SynapsVault/contracts/actions"><img src="https://github.com/SynapsVault/contracts/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
     <img src="https://img.shields.io/badge/Soroban-v21-7D00FF" alt="Soroban v21">
     <img src="https://img.shields.io/badge/Rust-1.78%2B-orange" alt="Rust">
     <img src="https://img.shields.io/badge/network-Stellar-blue" alt="Stellar">
@@ -63,7 +63,7 @@ rustup target add wasm32-unknown-unknown
 cargo install --locked soroban-cli
 
 # Clone
-git clone https://github.com/SynapsVault/SynapsVault-contracts
+git clone https://github.com/SynapsVault/contracts SynapsVault-contracts
 cd SynapsVault-contracts
 
 # Run tests
@@ -148,8 +148,8 @@ All persistent entries are bumped **90 days** on every write — actively manage
 
 | Repo | Description |
 |---|---|
-| [SynapsVault-frontend](https://github.com/SynapsVault/SynapsVault-frontend) | React UI |
-| [SynapsVault-backend](https://github.com/SynapsVault/SynapsVault-backend) | Express API |
+| [SynapsVault-frontend](https://github.com/SynapsVault/frontend) | React UI |
+| [SynapsVault-backend](https://github.com/SynapsVault/backend) | Express API |
 
 ## License
 
