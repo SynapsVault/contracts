@@ -12,8 +12,27 @@ permissions:
   contents: write
 
 jobs:
+  check-secrets:
+    name: Check deploy secrets
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - id: check
+        env:
+          DEPLOYER_SECRET: ${{ secrets.DEPLOYER_SECRET }}
+        run: |
+          if [ -n "$DEPLOYER_SECRET" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::DEPLOYER_SECRET is not set — skipping testnet deploy. Add the deploy secrets in repo Settings → Secrets → Actions."
+          fi
+
   deploy:
     name: Build + Deploy + Init on Stellar Testnet
+    needs: check-secrets
+    if: needs.check-secrets.outputs.ready == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
