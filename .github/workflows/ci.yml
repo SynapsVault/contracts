@@ -47,6 +47,22 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace
 
+      - name: Check docs/CONTRACTS.md exists
+        run: test -f docs/CONTRACTS.md
+
+      - name: Build docs (rustdoc)
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Verify contract versions
+        run: |
+          set -euo pipefail
+          for pkg in vault-registry access-lease subscription; do
+            echo "Checking version for $pkg"
+            cargo test --package "$pkg" -- --ignored version_check 2>/dev/null \
+              || cargo test --package "$pkg" version_check
+          done
+
   build:
     name: Build WASM
     runs-on: ubuntu-latest

@@ -132,13 +132,26 @@ jobs:
             --network testnet \
             -- init --admin "$BACKEND_PUBLIC"
 
+      - name: Read contract versions
+        run: |
+          for PKG in vault-registry access-lease subscription; do
+            VAR=$(echo "$PKG" | tr '[:lower:]-' '[:upper:]_')_VERSION
+            VERSION=$(cargo metadata --no-deps --format-version 1 \
+              | jq -r --arg pkg "$PKG" '.packages[] | select(.name == $pkg) | .version')
+            echo "${VAR}=${VERSION}" >> $GITHUB_ENV
+            echo "::notice::${PKG} version=${VERSION}"
+          done
+
       - name: Save + commit contract IDs
         run: |
           mkdir -p deployed
           cat > deployed/contract-ids.env << EOF
           vault_registry=$VAULT_REGISTRY
+          vault_registry_version=$VAULT_REGISTRY_VERSION
           access_lease=$ACCESS_LEASE
+          access_lease_version=$ACCESS_LEASE_VERSION
           subscription=$SUBSCRIPTION
+          subscription_version=$SUBSCRIPTION_VERSION
           network=testnet
           deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           EOF
@@ -153,10 +166,10 @@ jobs:
         run: |
           cat deployed/contract-ids.env
           echo "## ✅ SynapsVault Contracts on Stellar Testnet" >> $GITHUB_STEP_SUMMARY
-          echo "| Contract | ID |" >> $GITHUB_STEP_SUMMARY
-          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| vault-registry | \`$VAULT_REGISTRY\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| access-lease   | \`$ACCESS_LEASE\` |"   >> $GITHUB_STEP_SUMMARY
-          echo "| subscription   | \`$SUBSCRIPTION\` |"   >> $GITHUB_STEP_SUMMARY
+          echo "| Contract | ID | Version |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| vault-registry | \`$VAULT_REGISTRY\` | \`$VAULT_REGISTRY_VERSION\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| access-lease   | \`$ACCESS_LEASE\` | \`$ACCESS_LEASE_VERSION\` |"   >> $GITHUB_STEP_SUMMARY
+          echo "| subscription   | \`$SUBSCRIPTION\` | \`$SUBSCRIPTION_VERSION\` |"   >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "[View on Stellar Expert →](https://stellar.expert/explorer/testnet/contract/$VAULT_REGISTRY)" >> $GITHUB_STEP_SUMMARY
