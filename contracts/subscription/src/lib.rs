@@ -12,48 +12,90 @@ const CYCLE:       u32 = 30 * DAY;         // 30-day billing cycle
 const BUMP:        u32 = 365 * DAY;        // 1-year TTL
 const BUMP_THRESH: u32 = BUMP - DAY;
 
+/// A recurring subscription plan offered by a publisher.
+///
+/// Plans are keyed by `plan_id` and can be deactivated by their publisher to
+/// prevent new subscriptions. Existing subscribers are unaffected by
+/// deactivation and continue to renew until they cancel.
 /// Contract version, sourced from Cargo.toml at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Plan {
+    /// Unique, publisher-chosen identifier for the plan.
     pub plan_id:         String,
+    /// Wallet that created the plan and is the only party allowed to deactivate it.
     pub publisher:       Address,
+    /// Price charged per 30-day billing cycle, denominated in USDC stroops
+    /// (7 decimal places). Must be strictly positive.
     pub price_per_cycle: i128,  // USDC stroops (7 decimal places)
+    /// Whether new subscriptions are currently allowed. Set to `false` by
+    /// [`SubscriptionManager::deactivate_plan`].
     pub active:          bool,
 }
 
+/// A subscriber's enrolment in a [`Plan`].
+///
+/// Access is granted while `!cancelled && current_period_end > ledger.sequence()`.
+/// Each billing cycle is exactly 30 days (`CYCLE` ledgers). Cancellation is
+/// non-destructive: it only flips `cancelled`, leaving access intact until the
+/// end of the already-paid period.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Subscription {
+    /// Identifier of the plan this subscription belongs to.
     pub plan_id:             String,
+    /// Wallet receiving access to the plan's content.
     pub subscriber:          Address,
+    /// Ledger sequence at which the subscription was first created.
     pub started_at:          u32,
+    /// Ledger sequence at which the current paid period expires. Renewals
+    /// extend this by one `CYCLE` (30 days).
     pub current_period_end:  u32,
+    /// Set to `true` by [`SubscriptionManager::cancel`]. Cancelled
+    /// subscriptions cannot be renewed and are not considered active.
     pub cancelled:           bool,
+    /// Number of successful renewals applied to this subscription.
     pub total_renewals:      u32,
 }
 
+/// Storage keys used by the contract.
+///
+/// `Admin` lives in instance storage; `Plan` and `Sub` entries live in
+/// persistent storage and are TTL-bumped on every write.
 #[contracttype]
 pub enum DataKey {
+    /// Address authorised to call [`SubscriptionManager::subscribe`] and
+    /// [`SubscriptionManager::renew`]. Set once by [`SubscriptionManager::init`].
     Admin,
+    /// A [`Plan`] keyed by its `plan_id`.
     Plan(String),
+    /// A [`Subscription`] keyed by `(plan_id, subscriber)`.
     Sub(String, Address),
     Version,
 }
 
+/// Error codes returned by the subscription manager.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Error {
+    /// Caller failed the admin `require_auth` check.
     NotAdmin       = 1,
+    /// No plan exists for the supplied `plan_id`.
     PlanNotFound   = 2,
+    /// The plan exists but has been deactivated; new subscriptions are rejected.
     PlanInactive   = 3,
+    /// The subscriber already has an active, non-expired subscription to this plan.
     AlreadySubbed  = 4,
+    /// No subscription exists for the supplied `(plan_id, subscriber)` pair.
     SubNotFound    = 5,
+    /// The subscription has been cancelled and can no longer be renewed.
     Cancelled      = 6,
+    /// `price_per_cycle` was not strictly positive.
     InvalidPrice   = 7,
+    /// `init` has not been called, so no admin is configured.
     NotInitialised = 8,
 }
 
@@ -62,7 +104,13 @@ pub struct SubscriptionManager;
 
 #[contractimpl]
 impl SubscriptionManager {
-    /// Initialise — set the admin wallet. Must be called once after deployment.
+    /// Initialise the contract by setting the admin wallet.
+    ///
+    /// Must be called exactly once after deployment. The admin is the only
+    /// address permitted to call [`Self::subscribe`] and [`Self::renew`].
+    ///
+    /// # Parameters
+    /// - `admin`: wallet that will act as the backend operator.
     pub fn init(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -71,6 +119,18 @@ impl SubscriptionManager {
         env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
     }
 
+    /// Create a new subscription plan.
+    ///
+    /// Requires authorisation from `publisher`. The plan becomes immediately
+    /// active and can be subscribed to by the admin.
+    ///
+    /// # Parameters
+    /// - `publisher`: wallet owning the plan; must sign the transaction.
+    /// - `plan_id`: unique identifier for the plan.
+    /// - `price_per_cycle`: price per 30-day cycle in USDC stroops; must be `> 0`.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidPrice`] if `price_per_cycle <= 0`.
     /// Return the contract version string. Permissionless.
     pub fn get_version(env: Env) -> String {
         env.storage()
@@ -112,7 +172,13 @@ impl SubscriptionManager {
         Ok(plan)
     }
 
-    /// Publisher deactivates a plan — no new subscribers allowed.
+    /// Deactivate a plan so no new subscribers can join.
+    ///
+    /// Requires authorisation from the plan's publisher. Existing subscriptions
+    /// remain valid and can still be renewed; only new subscriptions are blocked.
+    ///
+    /// # Errors
+    /// - [`Error::PlanNotFound`] if no plan exists for `plan_id`.
     pub fn deactivate_plan(env: Env, plan_id: String) -> Result<(), Error> {
         let key = DataKey::Plan(plan_id);
         let mut plan: Plan = env
@@ -126,7 +192,21 @@ impl SubscriptionManager {
         Ok(())
     }
 
-    /// Backend subscribes a buyer after payment is confirmed (admin only).
+    /// Subscribe a buyer to a plan after off-chain payment confirmation.
+    ///
+    /// Admin-only. Creates a fresh subscription with a 30-day period starting
+    /// at the current ledger sequence. If a previous subscription exists but is
+    /// cancelled or expired, it is overwritten.
+    ///
+    /// # Parameters
+    /// - `plan_id`: plan to subscribe to; must exist and be active.
+    /// - `subscriber`: wallet receiving access.
+    ///
+    /// # Errors
+    /// - [`Error::NotAdmin`] if the caller is not the configured admin.
+    /// - [`Error::PlanNotFound`] if the plan does not exist.
+    /// - [`Error::PlanInactive`] if the plan has been deactivated.
+    /// - [`Error::AlreadySubbed`] if an active, non-expired subscription exists.
     pub fn subscribe(
         env: Env,
         plan_id: String,
@@ -167,7 +247,17 @@ impl SubscriptionManager {
         Ok(sub)
     }
 
-    /// Admin renews a subscription by one billing cycle after payment.
+    /// Renew a subscription by one 30-day billing cycle after payment.
+    ///
+    /// Admin-only. The new period end is computed as
+    /// `max(current_period_end, now) + CYCLE`, so renewals stack from the end
+    /// of the current period when it is still in the future, or from `now`
+    /// when the subscription has already lapsed.
+    ///
+    /// # Errors
+    /// - [`Error::NotAdmin`] if the caller is not the configured admin.
+    /// - [`Error::SubNotFound`] if no subscription exists for the pair.
+    /// - [`Error::Cancelled`] if the subscription has been cancelled.
     pub fn renew(
         env: Env,
         plan_id: String,
@@ -195,8 +285,14 @@ impl SubscriptionManager {
         Ok(sub)
     }
 
-    /// Subscriber cancels their own subscription.
-    /// Access continues until `current_period_end`.
+    /// Cancel the caller's own subscription.
+    ///
+    /// Requires authorisation from `subscriber`. Cancellation is idempotent in
+    /// effect: access continues until `current_period_end`, after which the
+    /// subscription is no longer active and cannot be renewed.
+    ///
+    /// # Errors
+    /// - [`Error::SubNotFound`] if no subscription exists for the pair.
     pub fn cancel(env: Env, plan_id: String, subscriber: Address) -> Result<(), Error> {
         subscriber.require_auth();
         let key = DataKey::Sub(plan_id, subscriber);
@@ -210,7 +306,11 @@ impl SubscriptionManager {
         Ok(())
     }
 
-    /// Returns `true` if subscriber has active, non-expired access. Permissionless.
+    /// Return `true` if the subscriber currently has active access.
+    ///
+    /// Access is active when the subscription exists, is not cancelled, and
+    /// `current_period_end` is strictly greater than the current ledger
+    /// sequence. Permissionless — safe to call from any context.
     pub fn is_active(env: Env, plan_id: String, subscriber: Address) -> bool {
         let key = DataKey::Sub(plan_id, subscriber);
         match env.storage().persistent().get::<_, Subscription>(&key) {
@@ -219,7 +319,13 @@ impl SubscriptionManager {
         }
     }
 
-    /// Return the full Subscription struct. Permissionless.
+    /// Return the full [`Subscription`] record for a `(plan_id, subscriber)` pair.
+    ///
+    /// Permissionless. Returns the stored record regardless of whether it is
+    /// cancelled or expired.
+    ///
+    /// # Errors
+    /// - [`Error::SubNotFound`] if no subscription exists for the pair.
     pub fn get_subscription(
         env: Env,
         plan_id: String,

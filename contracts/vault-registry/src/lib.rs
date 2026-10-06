@@ -20,11 +20,25 @@ use soroban_sdk::{
 const DAY_IN_LEDGERS: u32 = 17280;
 const BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
 const LIFETIME_THRESHOLD: u32 = BUMP_AMOUNT - DAY_IN_LEDGERS;
-/// Max length for metadata pointers (IPFS URI, content hash, compact JSON anchor).
+/// Maximum byte length of a metadata pointer (IPFS URI, content hash, compact
+/// JSON anchor). Enforced on `register` and `update_metadata`; longer values
+/// are rejected with [`Error::MetadataTooLong`].
 pub const MAX_METADATA_POINTER_LEN: u32 = 512;
+/// Maximum number of discovery tags allowed per resource. Exceeding this is
+/// rejected with [`Error::InvalidTag`].
 const MAX_TAGS: u32 = 8;
+/// Maximum byte length of a single discovery tag. Tags must be non-empty and
+/// no longer than this; violations are rejected with [`Error::InvalidTag`].
 const MAX_TAG_LEN: u32 = 32;
 
+/// A registered vault resource.
+///
+/// Invariants:
+/// - `id` is unique across the registry and immutable once registered.
+/// - `price` is strictly positive (in USDC stroops, 7 decimals).
+/// - `metadata.len() <= MAX_METADATA_POINTER_LEN`.
+/// - `tags.len() <= MAX_TAGS`, each tag non-empty and `<= MAX_TAG_LEN` bytes.
+/// - Only `creator` may mutate the resource (enforced via `require_auth`).
 /// Contract version, sourced from the crate manifest at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Minimum version this contract is compatible with.
@@ -33,32 +47,51 @@ pub const MIN_COMPATIBLE_VERSION: &str = "0.1.0";
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Resource {
+    /// Unique, immutable resource identifier.
     pub id: String,
+    /// Current owner; the only address authorized to mutate this resource.
     pub creator: Address,
+    /// Price in USDC stroops (7 decimals); always strictly positive.
     pub price: i128,
+    /// Off-chain content anchor (IPFS URI, content hash, etc.).
     pub metadata: String,
+    /// Whether the resource is discoverable via `list`. Defaults to `true`.
     pub listed: bool,
     /// Discovery labels (e.g. "dataset", "research"). Distinct from `metadata`,
     /// which remains the off-chain content anchor (IPFS URI, content hash, etc.).
     pub tags: Vec<String>,
 }
 
+/// Storage keys for the registry.
+///
+/// `Resource(id)` and `Index(i)` live in persistent storage and have their TTL
+/// bumped on every write; `Count` lives in instance storage and is bumped
+/// alongside it.
 #[contracttype]
 pub enum DataKey {
+    /// Maps a resource id to its [`Resource`] record.
     Resource(String),
+    /// Monotonic count of resources ever registered (never decremented).
     Count,
+    /// Maps insertion index `i` (in `0..Count`) to a resource id.
     Index(u32),
     Version,
 }
 
+/// Errors returned by registry operations.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
+    /// A resource with the given id is already registered.
     AlreadyRegistered = 1,
+    /// No resource exists with the given id.
     NotFound = 2,
+    /// Price must be strictly positive.
     InvalidPrice = 3,
+    /// Metadata pointer exceeds [`MAX_METADATA_POINTER_LEN`].
     MetadataTooLong = 4,
+    /// Tags exceed [`MAX_TAGS`], or a tag is empty or exceeds [`MAX_TAG_LEN`].
     InvalidTag = 5,
 }
 
@@ -67,8 +100,21 @@ pub struct VaultRegistry;
 
 #[contractimpl]
 impl VaultRegistry {
-    /// Register a new resource. Errors if `id` already exists or `price <= 0`.
-    /// Requires the creator's authorization.
+    /// Register a new resource.
+    ///
+    /// Requires the creator's authorization. The resource is listed by default.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidPrice`] if `price <= 0`.
+    /// - [`Error::MetadataTooLong`] if `metadata` exceeds
+    ///   [`MAX_METADATA_POINTER_LEN`].
+    /// - [`Error::InvalidTag`] if `tags` exceed [`MAX_TAGS`] or any tag is
+    ///   empty or exceeds [`MAX_TAG_LEN`].
+    /// - [`Error::AlreadyRegistered`] if `id` already exists.
+    ///
+    /// # Invariants
+    /// On success, `Count` is incremented by one (monotonic) and the new
+    /// resource plus its index entry have their persistent TTL bumped.
     pub fn register(
         env: Env,
         creator: Address,
@@ -114,7 +160,13 @@ impl VaultRegistry {
         Ok(())
     }
 
-    /// Update a resource's price. Only the creator may call this.
+    /// Update a resource's price.
+    ///
+    /// Only the creator may call this (enforced via `require_auth`).
+    ///
+    /// # Errors
+    /// - [`Error::InvalidPrice`] if `new_price <= 0`.
+    /// - [`Error::NotFound`] if no resource exists with `id`.
     pub fn set_price(env: Env, id: String, new_price: i128) -> Result<(), Error> {
         if new_price <= 0 {
             return Err(Error::InvalidPrice);
@@ -128,7 +180,14 @@ impl VaultRegistry {
         Ok(())
     }
 
-    /// Update a resource's metadata pointer. Only the creator may call this.
+    /// Update a resource's metadata pointer.
+    ///
+    /// Only the creator may call this (enforced via `require_auth`).
+    ///
+    /// # Errors
+    /// - [`Error::NotFound`] if no resource exists with `id`.
+    /// - [`Error::MetadataTooLong`] if `metadata` exceeds
+    ///   [`MAX_METADATA_POINTER_LEN`].
     pub fn update_metadata(env: Env, id: String, metadata: String) -> Result<(), Error> {
         let mut resource = Self::load(&env, &id)?;
         resource.creator.require_auth();
@@ -139,8 +198,15 @@ impl VaultRegistry {
         Ok(())
     }
 
-    /// Replace a resource's discovery tags. Only the creator may call this.
-    /// Does not modify `metadata` (the off-chain content pointer).
+    /// Replace a resource's discovery tags.
+    ///
+    /// Only the creator may call this (enforced via `require_auth`). Does not
+    /// modify `metadata` (the off-chain content pointer).
+    ///
+    /// # Errors
+    /// - [`Error::InvalidTag`] if `tags` exceed [`MAX_TAGS`] or any tag is
+    ///   empty or exceeds [`MAX_TAG_LEN`].
+    /// - [`Error::NotFound`] if no resource exists with `id`.
     pub fn set_tags(env: Env, id: String, tags: Vec<String>) -> Result<(), Error> {
         Self::validate_tags(&env, &tags)?;
         let mut resource = Self::load(&env, &id)?;
@@ -151,7 +217,13 @@ impl VaultRegistry {
         Ok(())
     }
 
-    /// Hand ownership to a new creator. Only the current creator may call this.
+    /// Hand ownership to a new creator.
+    ///
+    /// Only the current creator may call this (enforced via `require_auth`).
+    /// The registry `Count` is not affected by transfers.
+    ///
+    /// # Errors
+    /// - [`Error::NotFound`] if no resource exists with `id`.
     pub fn transfer_ownership(env: Env, id: String, new_creator: Address) -> Result<(), Error> {
         let mut resource = Self::load(&env, &id)?;
         resource.creator.require_auth();
@@ -162,7 +234,12 @@ impl VaultRegistry {
         Ok(())
     }
 
-    /// Set the listing state of a resource. Only the creator may call this.
+    /// Set the listing state of a resource.
+    ///
+    /// Only the creator may call this (enforced via `require_auth`).
+    ///
+    /// # Errors
+    /// - [`Error::NotFound`] if no resource exists with `id`.
     pub fn set_listed(env: Env, id: String, listed: bool) -> Result<(), Error> {
         let mut resource = Self::load(&env, &id)?;
         resource.creator.require_auth();
@@ -173,12 +250,20 @@ impl VaultRegistry {
         Ok(())
     }
 
-    /// Delist a resource (convenience method for set_listed(false)). Only the creator may call this.
+    /// Delist a resource (convenience method for `set_listed(false)`).
+    ///
+    /// Only the creator may call this (enforced via `require_auth`).
+    ///
+    /// # Errors
+    /// - [`Error::NotFound`] if no resource exists with `id`.
     pub fn delist(env: Env, id: String) -> Result<(), Error> {
         Self::set_listed(env, id, false)
     }
 
-    /// Paginated resource list in insertion order. `limit` is capped at 20.
+    /// Paginated resource list in insertion order.
+    ///
+    /// Returns up to `limit` resources starting at insertion index `start`;
+    /// `limit` is capped at 20. Missing index or resource entries are skipped.
     pub fn list(env: Env, start: u32, limit: u32) -> Vec<Resource> {
         let total: u32 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
         let page_size = limit.min(20);
@@ -203,7 +288,10 @@ impl VaultRegistry {
         result
     }
 
-    /// Fetch a resource. Errors with `NotFound` if it does not exist.
+    /// Fetch a resource.
+    ///
+    /// # Errors
+    /// - [`Error::NotFound`] if no resource exists with `id`.
     pub fn get(env: Env, id: String) -> Result<Resource, Error> {
         Self::load(&env, &id)
     }
@@ -213,13 +301,19 @@ impl VaultRegistry {
         env.storage().persistent().has(&DataKey::Resource(id))
     }
 
-    /// Get the owner address of a resource. Errors with `NotFound` if it does not exist.
+    /// Get the owner address of a resource.
+    ///
+    /// # Errors
+    /// - [`Error::NotFound`] if no resource exists with `id`.
     pub fn get_owner(env: Env, id: String) -> Result<Address, Error> {
         let resource = Self::load(&env, &id)?;
         Ok(resource.creator)
     }
 
-    /// Total number of resources successfully registered (monotonic; not decremented on transfer).
+    /// Total number of resources successfully registered.
+    ///
+    /// Monotonic: incremented on each successful `register` and never
+    /// decremented (including on ownership transfer).
     pub fn count(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::Count).unwrap_or(0)
     }
@@ -276,7 +370,9 @@ impl VaultRegistry {
         Self::bump_persistent(env, &key);
     }
 
-    /// Extend persistent entry TTL when below threshold (Soroban archival safety).
+    /// Extend a persistent entry's TTL when below threshold (Soroban archival
+    /// safety). Called on every persistent write so actively-managed resources
+    /// are never archived out from under us.
     fn bump_persistent<K>(env: &Env, key: &K)
     where
         K: IntoVal<Env, Val>,
@@ -286,6 +382,8 @@ impl VaultRegistry {
             .extend_ttl(key, LIFETIME_THRESHOLD, BUMP_AMOUNT);
     }
 
+    /// Extend the instance entry's TTL when below threshold. Called alongside
+    /// persistent bumps so `Count` and the index stay live.
     fn bump_instance(env: &Env) {
         env.storage()
             .instance()

@@ -20,6 +20,8 @@ The on-chain registry for SynapsVault resources. Stores creator address, price (
 
 Only the registered creator can mutate their resource (`require_auth`). Ownership can be transferred. Supports paginated listing and metadata updates.
 
+See [`docs/CONTRACTS.md`](docs/CONTRACTS.md#vault-registry) for the full interface reference.
+
 ### `access-lease` ⭐
 
 Time-limited on-chain access grants. The backend issues a `Lease` struct with a specific `expires_at` ledger sequence. Any party can verify access with a single read — no need to trust the backend.
@@ -34,6 +36,8 @@ Time-limited on-chain access grants. The backend issues a `Lease` struct with a 
 | `is_valid(resource_id, buyer)` | None | Check active status |
 | `get_lease(resource_id, buyer)` | None | Full lease struct |
 | `revoke_lease(resource_id, buyer)` | Admin | Revoke on refund / ToS |
+
+See [`docs/CONTRACTS.md`](docs/CONTRACTS.md#access-lease) for the full interface reference.
 
 ### `subscription` ⭐
 
@@ -51,6 +55,16 @@ Recurring 30-day subscription plans. Publishers define plans; the backend subscr
 | `cancel(plan_id, subscriber)` | Subscriber | Self-cancel |
 | `is_active(plan_id, subscriber)` | None | Check active status |
 | `get_subscription(plan_id, subscriber)` | None | Full sub struct |
+
+See [`docs/CONTRACTS.md`](docs/CONTRACTS.md#subscription) for the full interface reference.
+
+---
+
+## Documentation
+
+Detailed contract documentation lives in [`docs/CONTRACTS.md`](docs/CONTRACTS.md). It covers the full public interface, data structures, storage layout, and error codes for each contract.
+
+> **Note:** Keep documentation in sync with code. When you change a contract's public interface, storage layout, or error codes, update `docs/CONTRACTS.md` in the same pull request.
 
 ---
 
