@@ -41,6 +41,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace
 
+      - name: Check docs/CONTRACTS.md exists
+        run: test -f docs/CONTRACTS.md
+
+      - name: Build docs (rustdoc)
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   build:
     name: Build WASM
     runs-on: ubuntu-latest
