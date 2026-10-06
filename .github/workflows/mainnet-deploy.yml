@@ -1,0 +1,128 @@
+name: Mainnet Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "deploy-mainnet" to confirm mainnet deployment'
+        required: true
+        type: string
+
+jobs:
+  confirm:
+    name: Confirmation Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify confirmation input
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "deploy-mainnet" ]; then
+            echo "Confirmation failed. You must type 'deploy-mainnet' to proceed."
+            exit 1
+          fi
+          echo "Confirmation accepted. Proceeding with mainnet deployment."
+
+  deploy:
+    name: Deploy Contracts to Mainnet
+    needs: confirm
+    runs-on: ubuntu-latest
+    environment: mainnet
+    env:
+      NETWORK: mainnet
+      RPC_URL: https://soroban-mainnet.stellar.org
+      NETWORK_PASSPHRASE: "Public Global Stellar Network ; September 2015"
+      DEPLOYER_SECRET: ${{ secrets.MAINNET_DEPLOYER_SECRET }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install Soroban CLI
+        run: |
+          cargo install --locked soroban-cli
+
+      - name: Build contracts
+        run: |
+          cargo build --target wasm32-unknown-unknown --release
+
+      - name: Configure Soroban CLI
+        run: |
+          soroban config network add "$NETWORK" \
+            --rpc-url "$RPC_URL" \
+            --network-passphrase "$NETWORK_PASSPHRASE"
+
+      - name: Deploy access-lease contract
+        id: deploy_access_lease
+        run: |
+          ACCESS_LEASE_ID=$(soroban contract deploy \
+            --network "$NETWORK" \
+            --source "$DEPLOYER_SECRET" \
+            --wasm target/wasm32-unknown-unknown/release/access_lease.wasm)
+          echo "ACCESS_LEASE_ID=$ACCESS_LEASE_ID" >> "$GITHUB_ENV"
+          echo "access_lease_id=$ACCESS_LEASE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy subscription contract
+        id: deploy_subscription
+        run: |
+          SUBSCRIPTION_ID=$(soroban contract deploy \
+            --network "$NETWORK" \
+            --source "$DEPLOYER_SECRET" \
+            --wasm target/wasm32-unknown-unknown/release/subscription.wasm)
+          echo "SUBSCRIPTION_ID=$SUBSCRIPTION_ID" >> "$GITHUB_ENV"
+          echo "subscription_id=$SUBSCRIPTION_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy third contract
+        id: deploy_third
+        run: |
+          THIRD_ID=$(soroban contract deploy \
+            --network "$NETWORK" \
+            --source "$DEPLOYER_SECRET" \
+            --wasm target/wasm32-unknown-unknown/release/third_contract.wasm)
+          echo "THIRD_ID=$THIRD_ID" >> "$GITHUB_ENV"
+          echo "third_id=$THIRD_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Initialize access-lease contract
+        run: |
+          soroban contract invoke \
+            --network "$NETWORK" \
+            --source "$DEPLOYER_SECRET" \
+            --id "$ACCESS_LEASE_ID" \
+            -- init
+
+      - name: Initialize subscription contract
+        run: |
+          soroban contract invoke \
+            --network "$NETWORK" \
+            --source "$DEPLOYER_SECRET" \
+            --id "$SUBSCRIPTION_ID" \
+            -- init
+
+      - name: Write contract IDs to deployed/contract-ids.env
+        run: |
+          mkdir -p deployed
+          {
+            echo "NETWORK=$NETWORK"
+            echo "RPC_URL=$RPC_URL"
+            echo "NETWORK_PASSPHRASE=$NETWORK_PASSPHRASE"
+            echo "ACCESS_LEASE_ID=$ACCESS_LEASE_ID"
+            echo "SUBSCRIPTION_ID=$SUBSCRIPTION_ID"
+            echo "THIRD_ID=$THIRD_ID"
+          } > deployed/contract-ids.env
+          cat deployed/contract-ids.env
+
+      - name: Commit contract IDs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add deployed/contract-ids.env
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: update mainnet contract IDs [skip ci]"
+            git push
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

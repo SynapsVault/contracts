@@ -5,7 +5,7 @@
 //! Any third party can verify a buyer's access via `is_valid` without
 //! trusting the SynapsVault backend — the Stellar ledger is the source of truth.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String};
 
 const DAY:         u32 = 17_280; // ~5s/ledger × 17280 = 1 day
 const BUMP:        u32 = 90 * DAY;
@@ -64,6 +64,7 @@ pub enum Error {
     InvalidDuration = 4,
     /// `init` has not been called, so no admin is configured.
     NotInitialised  = 5,
+    UpgradeNotAllowed = 6,
 }
 
 #[contract]
@@ -257,6 +258,13 @@ impl AccessLease {
             return Err(Error::LeaseNotFound);
         }
         env.storage().persistent().remove(&key);
+        Ok(())
+    }
+
+    /// Upgrade the contract WASM to `new_wasm_hash` (admin only).
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
     }
 

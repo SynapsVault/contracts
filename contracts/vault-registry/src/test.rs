@@ -639,6 +639,130 @@ fn invalid_tag_rejected() {
 }
 
 #[test]
+fn init_sets_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VaultRegistry, ());
+    let client = VaultRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+
+    client.init(&admin);
+
+    assert_eq!(client.admin(), admin);
+}
+
+#[test]
+fn upgrade_requires_admin_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VaultRegistry, ());
+    let client = VaultRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+
+    client.init(&admin);
+
+    let wasm_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    client.upgrade(&wasm_hash);
+
+    // Admin auth must have been required for the upgrade call.
+    assert!(env.auths().iter().any(|(addr, _)| addr == &admin));
+}
+
+#[test]
+fn upgrade_rejects_non_admin() {
+    let env = Env::default();
+    let contract_id = env.register(VaultRegistry, ());
+    let client = VaultRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let non_admin = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.init(&admin);
+
+    // Only the non-admin authorizes the call; the contract must reject it.
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &non_admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "upgrade",
+            args: soroban_sdk::vec![
+                &env,
+                soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(
+                    &soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
+                    &env,
+                ),
+            ],
+            sub_invokes: &[],
+        },
+    }]);
+
+    let wasm_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    let res = client.try_upgrade(&wasm_hash);
+    assert!(res.is_err());
+}
+
+#[test]
+fn upgrade_with_valid_wasm_hash_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VaultRegistry, ());
+    let client = VaultRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+
+    client.init(&admin);
+
+    let wasm_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    client.upgrade(&wasm_hash);
+
+    // Contract remains functional after upgrade.
+    assert_eq!(client.count(), 0);
+}
+
+#[test]
+fn entrypoint_behavior_regression_after_optimization() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "regression");
+    let metadata = String::from_str(&env, "ipfs://QmRegression");
+
+    client.register(&creator, &id, &100i128, &metadata, &empty_tags(&env));
+    assert_eq!(client.count(), 1);
+    assert!(client.exists(&id));
+    assert_eq!(client.get(&id).metadata, metadata);
+
+    client.set_price(&id, &250i128);
+    assert_eq!(client.get(&id).price, 250i128);
+
+    client.set_listed(&id, &false);
+    assert!(!client.get(&id).listed);
+
+    client.transfer_ownership(&id, &Address::generate(&env));
+    assert_eq!(client.count(), 1);
+}
+
+#[test]
+fn footprint_regression_register_and_read() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "footprint");
+    let metadata = String::from_str(&env, "ipfs://QmFootprint");
+
+    client.register(&creator, &id, &100i128, &metadata, &empty_tags(&env));
+
+    // Entrypoints must still return correct values after optimization.
+    assert_eq!(client.count(), 1);
+    assert!(client.exists(&id));
+    let r = client.get(&id);
+    assert_eq!(r.id, id);
+    assert_eq!(r.creator, creator);
+    assert_eq!(r.price, 100i128);
+    assert_eq!(r.metadata, metadata);
+    assert!(r.listed);
+
+    let page = client.list(&0u32, &10u32);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page.get(0).unwrap().id, id);
+}
+
+#[test]
 fn version_returns_expected_string() {
     let (_env, _creator, client) = setup();
     assert_eq!(client.version(), String::from_str(&_env, "1.0.0"));
