@@ -5,7 +5,7 @@
 //! Publishers create plans; the backend subscribes buyers after payment confirmation
 //! and renews each billing cycle. Subscribers can self-cancel with access until period end.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String};
 
 const DAY:         u32 = 17_280;           // ~5s/ledger
 const CYCLE:       u32 = 30 * DAY;         // 30-day billing cycle
@@ -204,6 +204,13 @@ impl SubscriptionManager {
             .persistent()
             .get(&DataKey::Sub(plan_id, subscriber))
             .ok_or(Error::SubNotFound)
+    }
+
+    /// Admin upgrades the contract WASM. Admin only.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
     }
 
     // ─── Internal helpers ────────────────────────────────────────────────────

@@ -11,8 +11,8 @@
 //! `require_auth`). Ownership can be transferred.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, IntoVal,
-    String, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    IntoVal, String, Val, Vec,
 };
 
 // ~5s ledgers → 17,280 per day. Persistent entries are bumped ~30 days on each
@@ -43,6 +43,7 @@ pub enum DataKey {
     Resource(String),
     Count,
     Index(u32),
+    Admin,
 }
 
 #[contracterror]
@@ -54,6 +55,8 @@ pub enum Error {
     InvalidPrice = 3,
     MetadataTooLong = 4,
     InvalidTag = 5,
+    NotAdmin = 6,
+    NotInitialised = 7,
 }
 
 #[contract]
@@ -61,6 +64,26 @@ pub struct VaultRegistry;
 
 #[contractimpl]
 impl VaultRegistry {
+    /// Initialise the contract with an admin address. Only callable once.
+    pub fn init(env: Env, admin: Address) -> Result<(), Error> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::AlreadyRegistered);
+        }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        Self::bump_instance(&env);
+        Ok(())
+    }
+
+    /// Upgrade the contract's WASM. Only the stored admin may call this.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        env.events()
+            .publish((symbol_short!("upgrade"),), new_wasm_hash);
+        Ok(())
+    }
+
     /// Register a new resource. Errors if `id` already exists or `price <= 0`.
     /// Requires the creator's authorization.
     pub fn register(
@@ -217,6 +240,16 @@ impl VaultRegistry {
 }
 
 impl VaultRegistry {
+    fn require_admin(env: &Env) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialised)?;
+        admin.require_auth();
+        Ok(())
+    }
+
     fn validate_metadata_pointer(metadata: &String) -> Result<(), Error> {
         if metadata.len() > MAX_METADATA_POINTER_LEN {
             return Err(Error::MetadataTooLong);

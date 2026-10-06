@@ -32,6 +32,12 @@ jobs:
       - name: Test vault-registry
         run: cargo test --package vault-registry
 
+      - name: Test vault-registry upgrade mechanism
+        run: cargo test --package vault-registry upgrade
+
+      - name: Gas / footprint check (vault-registry)
+        run: cargo test --package vault-registry --features testutils gas -- --nocapture
+
       - name: Test access-lease
         run: cargo test --package access-lease
 
