@@ -638,6 +638,20 @@ fn invalid_tag_rejected() {
     assert_eq!(client.try_set_tags(&id, &bad), Err(Ok(Error::InvalidTag)));
 }
 
+#[test]
+fn version_returns_expected_string() {
+    let (_env, _creator, client) = setup();
+    assert_eq!(client.version(), String::from_str(&_env, "1.0.0"));
+}
+
+#[test]
+fn version_is_stable_across_calls() {
+    let (_env, _creator, client) = setup();
+    let v1 = client.version();
+    let v2 = client.version();
+    assert_eq!(v1, v2);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
     #[test]

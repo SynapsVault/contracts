@@ -12,6 +12,9 @@ const CYCLE:       u32 = 30 * DAY;         // 30-day billing cycle
 const BUMP:        u32 = 365 * DAY;        // 1-year TTL
 const BUMP_THRESH: u32 = BUMP - DAY;
 
+/// Contract version, sourced from Cargo.toml at compile time.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Plan {
@@ -37,6 +40,7 @@ pub enum DataKey {
     Admin,
     Plan(String),
     Sub(String, Address),
+    Version,
 }
 
 #[contracterror]
@@ -61,7 +65,28 @@ impl SubscriptionManager {
     /// Initialise — set the admin wallet. Must be called once after deployment.
     pub fn init(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &String::from_str(&env, VERSION));
         env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
+    }
+
+    /// Return the contract version string. Permissionless.
+    pub fn get_version(env: Env) -> String {
+        env.storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or_else(|| String::from_str(&env, VERSION))
+    }
+
+    /// Returns `true` if the stored version matches the compiled version.
+    /// Useful for detecting a contract that needs migration after an upgrade.
+    pub fn is_compatible(env: Env) -> bool {
+        let stored: Option<String> = env.storage().instance().get(&DataKey::Version);
+        match stored {
+            Some(v) => v == String::from_str(&env, VERSION),
+            None    => false,
+        }
     }
 
     /// Publisher creates a subscription plan. `price_per_cycle` is in USDC stroops.
