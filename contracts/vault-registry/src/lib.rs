@@ -39,6 +39,11 @@ const MAX_TAG_LEN: u32 = 32;
 /// - `metadata.len() <= MAX_METADATA_POINTER_LEN`.
 /// - `tags.len() <= MAX_TAGS`, each tag non-empty and `<= MAX_TAG_LEN` bytes.
 /// - Only `creator` may mutate the resource (enforced via `require_auth`).
+/// Contract version, sourced from the crate manifest at compile time.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Minimum version this contract is compatible with.
+pub const MIN_COMPATIBLE_VERSION: &str = "0.1.0";
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Resource {
@@ -70,6 +75,7 @@ pub enum DataKey {
     Count,
     /// Maps insertion index `i` (in `0..Count`) to a resource id.
     Index(u32),
+    Version,
 }
 
 /// Errors returned by registry operations.
@@ -144,6 +150,9 @@ impl VaultRegistry {
         env.storage().persistent().set(&idx_key, &id);
         Self::bump_persistent(&env, &idx_key);
         env.storage().instance().set(&DataKey::Count, &(count + 1));
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &String::from_str(&env, VERSION));
         Self::bump_instance(&env);
 
         env.events()
@@ -308,6 +317,22 @@ impl VaultRegistry {
     pub fn count(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::Count).unwrap_or(0)
     }
+
+    /// Return the contract version string. Falls back to the compile-time
+    /// `VERSION` constant if no version has been stored yet.
+    pub fn get_version(env: Env) -> String {
+        env.storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or_else(|| String::from_str(&env, VERSION))
+    }
+
+    /// Whether `version` is compatible with this contract. A version is
+    /// considered compatible when its major/minor components match the
+    /// compile-time `VERSION`.
+    pub fn is_compatible(version: String) -> bool {
+        Self::compatibility_check(&version)
+    }
 }
 
 impl VaultRegistry {
@@ -363,6 +388,32 @@ impl VaultRegistry {
         env.storage()
             .instance()
             .extend_ttl(LIFETIME_THRESHOLD, BUMP_AMOUNT);
+    }
+
+    /// Compare the major/minor components of `version` against `VERSION`.
+    /// Returns true when they match, indicating wire-compatible storage.
+    fn compatibility_check(version: &String) -> bool {
+        Self::major_minor(version) == Self::major_minor(&String::from_str(&version.env(), VERSION))
+    }
+
+    /// Extract the "major.minor" prefix of a dotted version string.
+    fn major_minor(version: &String) -> String {
+        let env = version.env();
+        let mut result = String::from_str(&env, "");
+        let mut dots = 0u32;
+        for i in 0..version.len() {
+            let b = version.get(i).unwrap();
+            if b == b'.' {
+                dots += 1;
+                if dots == 2 {
+                    break;
+                }
+            }
+            let mut buf = [0u8; 1];
+            buf[0] = b;
+            result.push_str(&String::from_bytes(&env, &buf));
+        }
+        result
     }
 }
 
