@@ -11,6 +11,9 @@ const DAY:         u32 = 17_280; // ~5s/ledger × 17280 = 1 day
 const BUMP:        u32 = 90 * DAY;
 const BUMP_THRESH: u32 = BUMP - DAY;
 
+/// Contract version, sourced from Cargo.toml at compile time.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Lease {
@@ -25,6 +28,7 @@ pub struct Lease {
 pub enum DataKey {
     Admin,
     Lease(String, Address),
+    Version,
 }
 
 #[contracterror]
@@ -47,7 +51,18 @@ impl AccessLease {
     /// Must be called once immediately after deployment.
     pub fn init(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &String::from_str(&env, VERSION));
         env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
+    }
+
+    /// Return the contract version string. Permissionless.
+    pub fn get_version(env: Env) -> String {
+        env.storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or_else(|| String::from_str(&env, VERSION))
     }
 
     /// Grant a time-limited lease to `buyer` for `resource_id`.
@@ -151,6 +166,15 @@ impl AccessLease {
             .ok_or(Error::NotInitialised)?;
         admin.require_auth();
         Ok(())
+    }
+
+    /// Returns `true` if the stored version matches the compiled-in version.
+    /// Used to detect stale deployments that need re-initialisation.
+    pub fn is_compatible(env: Env) -> bool {
+        match env.storage().instance().get::<_, String>(&DataKey::Version) {
+            Some(stored) => stored == String::from_str(&env, VERSION),
+            None         => false,
+        }
     }
 }
 
