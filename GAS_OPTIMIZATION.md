@@ -37,15 +37,16 @@ those low and how to measure them.
 **WASM size**
 
 The release profile (workspace `Cargo.toml`) uses `opt-level = "z"`, LTO,
-`codegen-units = 1`, `panic = "abort"` and stripped symbols. CI fails the build
+`codegen-units = 1`, `panic = "abort"` and stripped symbols, and
+`stellar contract build` strips unused contract-spec entries. CI fails the build
 if any contract exceeds Soroban's 64 KiB limit and reports sizes in the job
 summary.
 
-| Contract | Release WASM (wasm32v1-none) |
+| Contract | Release WASM (`stellar contract build`, soroban-sdk 28) |
 |---|---|
-| `vault-registry` | ~26 KB |
-| `subscription` | ~22 KB |
-| `access-lease` | ~16 KB |
+| `subscription` | ~16 KB |
+| `vault-registry` | ~15 KB |
+| `access-lease` | ~11 KB |
 
 ## Measuring
 
@@ -62,10 +63,10 @@ execution costs more, but relative changes track):
 
 | Entrypoint | CPU instructions | Memory bytes |
 |---|---|---|
-| `register` (2 tags) | ~77,000 | ~12,200 |
-| `set_price` | ~65,000 | ~9,900 |
-| `get` | ~30,000 | ~3,700 |
-| `list(0, 20)` | ~687,000 | ~75,800 |
+| `register` (2 tags) | ~129,000 | ~59,000 |
+| `set_price` | ~98,000 | ~45,000 |
+| `get` | ~51,000 | ~32,000 |
+| `list(0, 20)` | ~1,515,000 | ~652,000 |
 
 To measure real on-chain cost, simulate against testnet:
 

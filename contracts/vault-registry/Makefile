@@ -19,5 +19,5 @@ clean:
 
 # Refresh the prebuilt WASM used as the upgrade target in unit tests.
 fixture:
-	cargo build --target wasm32v1-none --release
+	stellar contract build --package vault-registry
 	cp ../../target/wasm32v1-none/release/vault_registry.wasm fixtures/vault_registry_upgrade_target.wasm

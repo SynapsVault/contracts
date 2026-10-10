@@ -16,7 +16,7 @@ Thanks for contributing! Please read the [Code of Conduct](CODE_OF_CONDUCT.md).
 # Rust (rust-toolchain.toml pins stable + the wasm32v1-none target)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Stellar CLI (only needed for deploying / invoking)
+# Stellar CLI v25.2+ (needed to build WASM, deploy and invoke)
 cargo install --locked stellar-cli
 ```
 
@@ -31,7 +31,7 @@ cargo test --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 # Build WASM (production)
-cargo build --target wasm32v1-none --release --workspace
+stellar contract build
 ```
 
 Notes:

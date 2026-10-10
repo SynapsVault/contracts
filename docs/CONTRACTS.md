@@ -24,6 +24,7 @@ storage or error codes must update this file in the same pull request.
 | Upgrades | `upgrade(new_wasm_hash)` — admin-only; storage is preserved. |
 | Versioning | `get_version()` returns the version recorded at `init` (crate version); `is_compatible(...)` detects stale deployments. |
 | Errors | Every fallible entrypoint returns `Result<_, Error>`; codes are stable and never renumbered. |
+| Events | Defined as `#[contractevent]` types (so they appear in the contract spec and generated bindings). Topics start with a fixed symbol; data is a single value. Unit tests (`events_have_documented_shape`) pin the wire format. |
 
 ### Roles
 

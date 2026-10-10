@@ -11,8 +11,8 @@
 //! `require_auth`). Ownership can be transferred.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
-    IntoVal, String, Val, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN,
+    ContractExecutable, Env, IntoVal, String, Val, Vec,
 };
 
 // ~5s ledgers → 17,280 per day. Persistent entries are bumped ~30 days on each
@@ -106,6 +106,73 @@ pub enum Error {
     AlreadyInitialised = 8,
 }
 
+/// Emitted by `init`. Topics: `("init",)`; data: admin.
+#[contractevent(topics = ["init"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitEvent {
+    pub admin: Address,
+}
+
+/// Emitted by `upgrade`. Topics: `("upgrade",)`; data: new WASM hash.
+#[contractevent(topics = ["upgrade"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeEvent {
+    pub new_wasm_hash: BytesN<32>,
+}
+
+/// Emitted by `register`. Topics: `("register", creator)`; data: resource id.
+#[contractevent(topics = ["register"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegisterEvent {
+    #[topic]
+    pub creator: Address,
+    pub id: String,
+}
+
+/// Emitted by `set_price`. Topics: `("setprice", id)`; data: new price.
+#[contractevent(topics = ["setprice"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetPriceEvent {
+    #[topic]
+    pub id: String,
+    pub price: i128,
+}
+
+/// Emitted by `update_metadata`. Topics: `("updmeta", id)`; no data.
+#[contractevent(topics = ["updmeta"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateMetadataEvent {
+    #[topic]
+    pub id: String,
+}
+
+/// Emitted by `set_tags`. Topics: `("settags", id)`; data: tags.
+#[contractevent(topics = ["settags"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetTagsEvent {
+    #[topic]
+    pub id: String,
+    pub tags: Vec<String>,
+}
+
+/// Emitted by `transfer_ownership`. Topics: `("transfer", id)`; data: new creator.
+#[contractevent(topics = ["transfer"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferEvent {
+    #[topic]
+    pub id: String,
+    pub new_creator: Address,
+}
+
+/// Emitted by `set_listed`. Topics: `("setlisted", id)`; data: listed flag.
+#[contractevent(topics = ["setlisted"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetListedEvent {
+    #[topic]
+    pub id: String,
+    pub listed: bool,
+}
+
 #[contract]
 pub struct VaultRegistry;
 
@@ -127,7 +194,7 @@ impl VaultRegistry {
             .instance()
             .set(&DataKey::Version, &String::from_str(&env, VERSION));
         Self::bump_instance(&env);
-        env.events().publish((symbol_short!("init"),), admin);
+        InitEvent { admin }.publish(&env);
         Ok(())
     }
 
@@ -146,9 +213,8 @@ impl VaultRegistry {
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         Self::require_admin(&env)?;
         env.deployer()
-            .update_current_contract_wasm(new_wasm_hash.clone());
-        env.events()
-            .publish((symbol_short!("upgrade"),), new_wasm_hash);
+            .update_current_contract(ContractExecutable::Wasm(new_wasm_hash.clone()));
+        UpgradeEvent { new_wasm_hash }.publish(&env);
         Ok(())
     }
 
@@ -204,8 +270,7 @@ impl VaultRegistry {
         env.storage().instance().set(&DataKey::Count, &(count + 1));
         Self::bump_instance(&env);
 
-        env.events()
-            .publish((symbol_short!("register"), creator), id);
+        RegisterEvent { creator, id }.publish(&env);
         Ok(())
     }
 
@@ -224,8 +289,11 @@ impl VaultRegistry {
         resource.creator.require_auth();
         resource.price = new_price;
         Self::save(&env, &resource);
-        env.events()
-            .publish((symbol_short!("setprice"), id), new_price);
+        SetPriceEvent {
+            id,
+            price: new_price,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -243,7 +311,7 @@ impl VaultRegistry {
         Self::validate_metadata_pointer(&metadata)?;
         resource.metadata = metadata;
         Self::save(&env, &resource);
-        env.events().publish((symbol_short!("updmeta"), id), ());
+        UpdateMetadataEvent { id }.publish(&env);
         Ok(())
     }
 
@@ -262,7 +330,7 @@ impl VaultRegistry {
         resource.creator.require_auth();
         resource.tags = tags.clone();
         Self::save(&env, &resource);
-        env.events().publish((symbol_short!("settags"), id), tags);
+        SetTagsEvent { id, tags }.publish(&env);
         Ok(())
     }
 
@@ -278,8 +346,7 @@ impl VaultRegistry {
         resource.creator.require_auth();
         resource.creator = new_creator.clone();
         Self::save(&env, &resource);
-        env.events()
-            .publish((symbol_short!("transfer"), id), new_creator);
+        TransferEvent { id, new_creator }.publish(&env);
         Ok(())
     }
 
@@ -294,8 +361,7 @@ impl VaultRegistry {
         resource.creator.require_auth();
         resource.listed = listed;
         Self::save(&env, &resource);
-        env.events()
-            .publish((symbol_short!("setlisted"), id), listed);
+        SetListedEvent { id, listed }.publish(&env);
         Ok(())
     }
 
