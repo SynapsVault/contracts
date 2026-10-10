@@ -26,10 +26,17 @@ const LIFETIME_THRESHOLD: u32 = BUMP_AMOUNT - DAY_IN_LEDGERS;
 pub const MAX_METADATA_POINTER_LEN: u32 = 512;
 /// Maximum number of discovery tags allowed per resource. Exceeding this is
 /// rejected with [`Error::InvalidTag`].
-const MAX_TAGS: u32 = 8;
+pub const MAX_TAGS: u32 = 8;
 /// Maximum byte length of a single discovery tag. Tags must be non-empty and
 /// no longer than this; violations are rejected with [`Error::InvalidTag`].
-const MAX_TAG_LEN: u32 = 32;
+pub const MAX_TAG_LEN: u32 = 32;
+
+/// Maximum page size returned by [`VaultRegistry::list`].
+pub const MAX_PAGE_SIZE: u32 = 20;
+/// Contract version, sourced from the crate manifest at compile time.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Minimum version this contract is compatible with.
+pub const MIN_COMPATIBLE_VERSION: &str = "0.1.0";
 
 /// A registered vault resource.
 ///
@@ -39,11 +46,6 @@ const MAX_TAG_LEN: u32 = 32;
 /// - `metadata.len() <= MAX_METADATA_POINTER_LEN`.
 /// - `tags.len() <= MAX_TAGS`, each tag non-empty and `<= MAX_TAG_LEN` bytes.
 /// - Only `creator` may mutate the resource (enforced via `require_auth`).
-/// Contract version, sourced from the crate manifest at compile time.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-/// Minimum version this contract is compatible with.
-pub const MIN_COMPATIBLE_VERSION: &str = "0.1.0";
-
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Resource {
@@ -75,7 +77,9 @@ pub enum DataKey {
     Count,
     /// Maps insertion index `i` (in `0..Count`) to a resource id.
     Index(u32),
+    /// Admin address allowed to upgrade the contract (instance storage).
     Admin,
+    /// Contract version recorded at `init` (instance storage).
     Version,
 }
 
@@ -94,8 +98,12 @@ pub enum Error {
     MetadataTooLong = 4,
     /// Tags exceed [`MAX_TAGS`], or a tag is empty or exceeds [`MAX_TAG_LEN`].
     InvalidTag = 5,
+    /// The caller is not the configured admin.
     NotAdmin = 6,
+    /// `init` has not been called, so no admin is configured.
     NotInitialised = 7,
+    /// `init` has already been called; the admin cannot be overwritten.
+    AlreadyInitialised = 8,
 }
 
 #[contract]
@@ -104,13 +112,34 @@ pub struct VaultRegistry;
 #[contractimpl]
 impl VaultRegistry {
     /// Initialise the contract with an admin address. Only callable once.
+    ///
+    /// The admin is only needed for [`upgrade`](VaultRegistry::upgrade); the registry
+    /// itself is usable without initialisation.
+    ///
+    /// # Errors
+    /// - [`Error::AlreadyInitialised`] if an admin is already set.
     pub fn init(env: Env, admin: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
-            return Err(Error::AlreadyRegistered);
+            return Err(Error::AlreadyInitialised);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &String::from_str(&env, VERSION));
         Self::bump_instance(&env);
+        env.events().publish((symbol_short!("init"),), admin);
         Ok(())
+    }
+
+    /// Return the configured admin address.
+    ///
+    /// # Errors
+    /// - [`Error::NotInitialised`] if `init` has not been called.
+    pub fn admin(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialised)
     }
 
     /// Upgrade the contract's WASM. Only the stored admin may call this.
@@ -151,7 +180,7 @@ impl VaultRegistry {
             return Err(Error::InvalidPrice);
         }
         Self::validate_metadata_pointer(&metadata)?;
-        Self::validate_tags(&env, &tags)?;
+        Self::validate_tags(&tags)?;
         let key = DataKey::Resource(id.clone());
         if env.storage().persistent().has(&key) {
             return Err(Error::AlreadyRegistered);
@@ -173,9 +202,6 @@ impl VaultRegistry {
         env.storage().persistent().set(&idx_key, &id);
         Self::bump_persistent(&env, &idx_key);
         env.storage().instance().set(&DataKey::Count, &(count + 1));
-        env.storage()
-            .instance()
-            .set(&DataKey::Version, &String::from_str(&env, VERSION));
         Self::bump_instance(&env);
 
         env.events()
@@ -231,7 +257,7 @@ impl VaultRegistry {
     ///   empty or exceeds [`MAX_TAG_LEN`].
     /// - [`Error::NotFound`] if no resource exists with `id`.
     pub fn set_tags(env: Env, id: String, tags: Vec<String>) -> Result<(), Error> {
-        Self::validate_tags(&env, &tags)?;
+        Self::validate_tags(&tags)?;
         let mut resource = Self::load(&env, &id)?;
         resource.creator.require_auth();
         resource.tags = tags.clone();
@@ -286,10 +312,11 @@ impl VaultRegistry {
     /// Paginated resource list in insertion order.
     ///
     /// Returns up to `limit` resources starting at insertion index `start`;
-    /// `limit` is capped at 20. Missing index or resource entries are skipped.
+    /// `limit` is capped at [`MAX_PAGE_SIZE`]. Missing index or resource
+    /// entries are skipped.
     pub fn list(env: Env, start: u32, limit: u32) -> Vec<Resource> {
         let total: u32 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
-        let page_size = limit.min(20);
+        let page_size = limit.min(MAX_PAGE_SIZE);
         let mut result: Vec<Resource> = Vec::new(&env);
         let mut i = start;
         while i < total && result.len() < page_size {
@@ -341,7 +368,12 @@ impl VaultRegistry {
         env.storage().instance().get(&DataKey::Count).unwrap_or(0)
     }
 
-    /// Return the contract version string. Falls back to the compile-time
+    /// Return the compile-time contract version of the running WASM.
+    pub fn version(env: Env) -> String {
+        String::from_str(&env, VERSION)
+    }
+
+    /// Return the version recorded at `init`. Falls back to the compile-time
     /// `VERSION` constant if no version has been stored yet.
     pub fn get_version(env: Env) -> String {
         env.storage()
@@ -376,12 +408,11 @@ impl VaultRegistry {
         Ok(())
     }
 
-    fn validate_tags(_env: &Env, tags: &Vec<String>) -> Result<(), Error> {
+    fn validate_tags(tags: &Vec<String>) -> Result<(), Error> {
         if tags.len() > MAX_TAGS {
             return Err(Error::InvalidTag);
         }
-        for i in 0..tags.len() {
-            let tag = tags.get(i).unwrap();
+        for tag in tags.iter() {
             let len = tag.len();
             if len == 0 || len > MAX_TAG_LEN {
                 return Err(Error::InvalidTag);
@@ -426,27 +457,28 @@ impl VaultRegistry {
     /// Compare the major/minor components of `version` against `VERSION`.
     /// Returns true when they match, indicating wire-compatible storage.
     fn compatibility_check(version: &String) -> bool {
-        Self::major_minor(version) == Self::major_minor(&String::from_str(&version.env(), VERSION))
+        const BUF_LEN: usize = 32;
+        let len = version.len() as usize;
+        if len == 0 || len > BUF_LEN {
+            return false;
+        }
+        let mut buf = [0u8; BUF_LEN];
+        version.copy_into_slice(&mut buf[..len]);
+        Self::major_minor(&buf[..len]) == Self::major_minor(VERSION.as_bytes())
     }
 
-    /// Extract the "major.minor" prefix of a dotted version string.
-    fn major_minor(version: &String) -> String {
-        let env = version.env();
-        let mut result = String::from_str(&env, "");
+    /// Return the "major.minor" prefix of a dotted version string.
+    fn major_minor(version: &[u8]) -> &[u8] {
         let mut dots = 0u32;
-        for i in 0..version.len() {
-            let b = version.get(i).unwrap();
-            if b == b'.' {
+        for (i, b) in version.iter().enumerate() {
+            if *b == b'.' {
                 dots += 1;
                 if dots == 2 {
-                    break;
+                    return &version[..i];
                 }
             }
-            let mut buf = [0u8; 1];
-            buf[0] = b;
-            result.push_str(&String::from_bytes(&env, &buf));
         }
-        result
+        version
     }
 }
 

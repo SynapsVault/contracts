@@ -5,65 +5,68 @@
 //! Publishers create plans; the backend subscribes buyers after payment confirmation
 //! and renews each billing cycle. Subscribers can self-cancel with access until period end.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
+};
 
-const DAY:         u32 = 17_280;           // ~5s/ledger
-const CYCLE:       u32 = 30 * DAY;         // 30-day billing cycle
-const BUMP:        u32 = 365 * DAY;        // 1-year TTL
+const DAY: u32 = 17_280; // ~5s/ledger
+/// Length of one billing cycle in ledgers (30 days).
+pub const CYCLE: u32 = 30 * DAY;
+const BUMP: u32 = 365 * DAY; // 1-year TTL
 const BUMP_THRESH: u32 = BUMP - DAY;
+
+/// Contract version, sourced from Cargo.toml at compile time.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// A recurring subscription plan offered by a publisher.
 ///
 /// Plans are keyed by `plan_id` and can be deactivated by their publisher to
 /// prevent new subscriptions. Existing subscribers are unaffected by
 /// deactivation and continue to renew until they cancel.
-/// Contract version, sourced from Cargo.toml at compile time.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Plan {
     /// Unique, publisher-chosen identifier for the plan.
-    pub plan_id:         String,
+    pub plan_id: String,
     /// Wallet that created the plan and is the only party allowed to deactivate it.
-    pub publisher:       Address,
+    pub publisher: Address,
     /// Price charged per 30-day billing cycle, denominated in USDC stroops
     /// (7 decimal places). Must be strictly positive.
-    pub price_per_cycle: i128,  // USDC stroops (7 decimal places)
+    pub price_per_cycle: i128,
     /// Whether new subscriptions are currently allowed. Set to `false` by
     /// [`SubscriptionManager::deactivate_plan`].
-    pub active:          bool,
+    pub active: bool,
 }
 
 /// A subscriber's enrolment in a [`Plan`].
 ///
-/// Access is granted while `!cancelled && current_period_end > ledger.sequence()`.
-/// Each billing cycle is exactly 30 days (`CYCLE` ledgers). Cancellation is
-/// non-destructive: it only flips `cancelled`, leaving access intact until the
-/// end of the already-paid period.
+/// Access is granted while `current_period_end > ledger.sequence()`. Each
+/// billing cycle is exactly 30 days ([`CYCLE`] ledgers). Cancellation is
+/// non-destructive: it only flips `cancelled` (which blocks renewals),
+/// leaving access intact until the end of the already-paid period.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Subscription {
     /// Identifier of the plan this subscription belongs to.
-    pub plan_id:             String,
+    pub plan_id: String,
     /// Wallet receiving access to the plan's content.
-    pub subscriber:          Address,
+    pub subscriber: Address,
     /// Ledger sequence at which the subscription was first created.
-    pub started_at:          u32,
+    pub started_at: u32,
     /// Ledger sequence at which the current paid period expires. Renewals
-    /// extend this by one `CYCLE` (30 days).
-    pub current_period_end:  u32,
+    /// extend this by one [`CYCLE`] (30 days).
+    pub current_period_end: u32,
     /// Set to `true` by [`SubscriptionManager::cancel`]. Cancelled
-    /// subscriptions cannot be renewed and are not considered active.
-    pub cancelled:           bool,
+    /// subscriptions cannot be renewed.
+    pub cancelled: bool,
     /// Number of successful renewals applied to this subscription.
-    pub total_renewals:      u32,
+    pub total_renewals: u32,
 }
 
 /// Storage keys used by the contract.
 ///
-/// `Admin` lives in instance storage; `Plan` and `Sub` entries live in
-/// persistent storage and are TTL-bumped on every write.
+/// `Admin` and `Version` live in instance storage; `Plan` and `Sub` entries
+/// live in persistent storage and are TTL-bumped on every write.
 #[contracttype]
 pub enum DataKey {
     /// Address authorised to call [`SubscriptionManager::subscribe`] and
@@ -73,6 +76,7 @@ pub enum DataKey {
     Plan(String),
     /// A [`Subscription`] keyed by `(plan_id, subscriber)`.
     Sub(String, Address),
+    /// Contract version recorded at `init`.
     Version,
 }
 
@@ -82,21 +86,27 @@ pub enum DataKey {
 #[repr(u32)]
 pub enum Error {
     /// Caller failed the admin `require_auth` check.
-    NotAdmin       = 1,
+    NotAdmin = 1,
     /// No plan exists for the supplied `plan_id`.
-    PlanNotFound   = 2,
+    PlanNotFound = 2,
     /// The plan exists but has been deactivated; new subscriptions are rejected.
-    PlanInactive   = 3,
-    /// The subscriber already has an active, non-expired subscription to this plan.
-    AlreadySubbed  = 4,
+    PlanInactive = 3,
+    /// The subscriber already has an active, non-cancelled subscription to this plan.
+    AlreadySubbed = 4,
     /// No subscription exists for the supplied `(plan_id, subscriber)` pair.
-    SubNotFound    = 5,
+    SubNotFound = 5,
     /// The subscription has been cancelled and can no longer be renewed.
-    Cancelled      = 6,
+    Cancelled = 6,
     /// `price_per_cycle` was not strictly positive.
-    InvalidPrice   = 7,
+    InvalidPrice = 7,
     /// `init` has not been called, so no admin is configured.
     NotInitialised = 8,
+    /// `init` has already been called; the admin cannot be overwritten.
+    AlreadyInitialised = 9,
+    /// A plan with this `plan_id` already exists.
+    PlanExists = 10,
+    /// The new period end would overflow the ledger sequence.
+    Overflow = 11,
 }
 
 #[contract]
@@ -107,16 +117,64 @@ impl SubscriptionManager {
     /// Initialise the contract by setting the admin wallet.
     ///
     /// Must be called exactly once after deployment. The admin is the only
-    /// address permitted to call [`Self::subscribe`] and [`Self::renew`].
+    /// address permitted to call [`SubscriptionManager::subscribe`] and [`SubscriptionManager::renew`].
     ///
-    /// # Parameters
-    /// - `admin`: wallet that will act as the backend operator.
-    pub fn init(env: Env, admin: Address) {
+    /// # Errors
+    /// - [`Error::AlreadyInitialised`] if an admin is already set. Use
+    ///   [`SubscriptionManager::set_admin`] to rotate it.
+    pub fn init(env: Env, admin: Address) -> Result<(), Error> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::AlreadyInitialised);
+        }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
             .set(&DataKey::Version, &String::from_str(&env, VERSION));
         env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
+        env.events().publish((symbol_short!("init"),), admin);
+        Ok(())
+    }
+
+    /// Return the configured admin address.
+    ///
+    /// # Errors
+    /// - [`Error::NotInitialised`] if `init` has not been called.
+    pub fn admin(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialised)
+    }
+
+    /// Rotate the admin to `new_admin`. Requires the current admin's auth.
+    ///
+    /// # Errors
+    /// - [`Error::NotInitialised`] if `init` has not been called.
+    pub fn set_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.events()
+            .publish((symbol_short!("setadmin"),), new_admin);
+        Ok(())
+    }
+
+    /// Return the version recorded at `init`, falling back to the compiled
+    /// version. Permissionless.
+    pub fn get_version(env: Env) -> String {
+        env.storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or_else(|| String::from_str(&env, VERSION))
+    }
+
+    /// Returns `true` if the stored version matches the compiled version.
+    /// Useful for detecting a contract that needs migration after an upgrade.
+    pub fn is_compatible(env: Env) -> bool {
+        let stored: Option<String> = env.storage().instance().get(&DataKey::Version);
+        match stored {
+            Some(v) => v == String::from_str(&env, VERSION),
+            None => false,
+        }
     }
 
     /// Create a new subscription plan.
@@ -131,25 +189,7 @@ impl SubscriptionManager {
     ///
     /// # Errors
     /// - [`Error::InvalidPrice`] if `price_per_cycle <= 0`.
-    /// Return the contract version string. Permissionless.
-    pub fn get_version(env: Env) -> String {
-        env.storage()
-            .instance()
-            .get(&DataKey::Version)
-            .unwrap_or_else(|| String::from_str(&env, VERSION))
-    }
-
-    /// Returns `true` if the stored version matches the compiled version.
-    /// Useful for detecting a contract that needs migration after an upgrade.
-    pub fn is_compatible(env: Env) -> bool {
-        let stored: Option<String> = env.storage().instance().get(&DataKey::Version);
-        match stored {
-            Some(v) => v == String::from_str(&env, VERSION),
-            None    => false,
-        }
-    }
-
-    /// Publisher creates a subscription plan. `price_per_cycle` is in USDC stroops.
+    /// - [`Error::PlanExists`] if `plan_id` is already taken.
     pub fn create_plan(
         env: Env,
         publisher: Address,
@@ -160,16 +200,34 @@ impl SubscriptionManager {
         if price_per_cycle <= 0 {
             return Err(Error::InvalidPrice);
         }
+        let key = DataKey::Plan(plan_id.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(Error::PlanExists);
+        }
         let plan = Plan {
             plan_id: plan_id.clone(),
-            publisher,
+            publisher: publisher.clone(),
             price_per_cycle,
             active: true,
         };
-        let key = DataKey::Plan(plan_id);
         env.storage().persistent().set(&key, &plan);
-        env.storage().persistent().extend_ttl(&key, BUMP_THRESH, BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        env.events()
+            .publish((symbol_short!("plan"), plan_id, publisher), price_per_cycle);
         Ok(plan)
+    }
+
+    /// Return the [`Plan`] for `plan_id`. Permissionless.
+    ///
+    /// # Errors
+    /// - [`Error::PlanNotFound`] if no plan exists for `plan_id`.
+    pub fn get_plan(env: Env, plan_id: String) -> Result<Plan, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Plan(plan_id))
+            .ok_or(Error::PlanNotFound)
     }
 
     /// Deactivate a plan so no new subscribers can join.
@@ -180,7 +238,7 @@ impl SubscriptionManager {
     /// # Errors
     /// - [`Error::PlanNotFound`] if no plan exists for `plan_id`.
     pub fn deactivate_plan(env: Env, plan_id: String) -> Result<(), Error> {
-        let key = DataKey::Plan(plan_id);
+        let key = DataKey::Plan(plan_id.clone());
         let mut plan: Plan = env
             .storage()
             .persistent()
@@ -189,6 +247,11 @@ impl SubscriptionManager {
         plan.publisher.require_auth();
         plan.active = false;
         env.storage().persistent().set(&key, &plan);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        env.events()
+            .publish((symbol_short!("deactiv"), plan_id), ());
         Ok(())
     }
 
@@ -196,17 +259,14 @@ impl SubscriptionManager {
     ///
     /// Admin-only. Creates a fresh subscription with a 30-day period starting
     /// at the current ledger sequence. If a previous subscription exists but is
-    /// cancelled or expired, it is overwritten.
-    ///
-    /// # Parameters
-    /// - `plan_id`: plan to subscribe to; must exist and be active.
-    /// - `subscriber`: wallet receiving access.
+    /// cancelled or expired, it is replaced; any still-paid time left on a
+    /// cancelled subscription is carried over.
     ///
     /// # Errors
-    /// - [`Error::NotAdmin`] if the caller is not the configured admin.
+    /// - [`Error::NotInitialised`] if `init` has not been called.
     /// - [`Error::PlanNotFound`] if the plan does not exist.
     /// - [`Error::PlanInactive`] if the plan has been deactivated.
-    /// - [`Error::AlreadySubbed`] if an active, non-expired subscription exists.
+    /// - [`Error::AlreadySubbed`] if an active, non-cancelled subscription exists.
     pub fn subscribe(
         env: Env,
         plan_id: String,
@@ -225,25 +285,35 @@ impl SubscriptionManager {
         }
 
         let key = DataKey::Sub(plan_id.clone(), subscriber.clone());
+        let now = env.ledger().sequence();
+        let mut base = now;
 
-        // Block double-subscribe if still active.
         if let Some(s) = env.storage().persistent().get::<_, Subscription>(&key) {
-            if !s.cancelled && s.current_period_end > env.ledger().sequence() {
-                return Err(Error::AlreadySubbed);
+            if s.current_period_end > now {
+                // Block double-subscribe if still active and not cancelled.
+                if !s.cancelled {
+                    return Err(Error::AlreadySubbed);
+                }
+                base = s.current_period_end;
             }
         }
 
-        let now = env.ledger().sequence();
         let sub = Subscription {
-            plan_id,
-            subscriber,
-            started_at:          now,
-            current_period_end:  now + CYCLE,
-            cancelled:           false,
-            total_renewals:      0,
+            plan_id: plan_id.clone(),
+            subscriber: subscriber.clone(),
+            started_at: now,
+            current_period_end: base.checked_add(CYCLE).ok_or(Error::Overflow)?,
+            cancelled: false,
+            total_renewals: 0,
         };
         env.storage().persistent().set(&key, &sub);
-        env.storage().persistent().extend_ttl(&key, BUMP_THRESH, BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        env.events().publish(
+            (symbol_short!("subscribe"), plan_id, subscriber),
+            sub.current_period_end,
+        );
         Ok(sub)
     }
 
@@ -255,14 +325,10 @@ impl SubscriptionManager {
     /// when the subscription has already lapsed.
     ///
     /// # Errors
-    /// - [`Error::NotAdmin`] if the caller is not the configured admin.
+    /// - [`Error::NotInitialised`] if `init` has not been called.
     /// - [`Error::SubNotFound`] if no subscription exists for the pair.
     /// - [`Error::Cancelled`] if the subscription has been cancelled.
-    pub fn renew(
-        env: Env,
-        plan_id: String,
-        subscriber: Address,
-    ) -> Result<Subscription, Error> {
+    pub fn renew(env: Env, plan_id: String, subscriber: Address) -> Result<Subscription, Error> {
         Self::require_admin(&env)?;
         let key = DataKey::Sub(plan_id.clone(), subscriber.clone());
         let mut sub: Subscription = env
@@ -277,45 +343,60 @@ impl SubscriptionManager {
 
         // Extend from end of current period, or from now if expired.
         let base = sub.current_period_end.max(env.ledger().sequence());
-        sub.current_period_end = base + CYCLE;
-        sub.total_renewals += 1;
+        sub.current_period_end = base.checked_add(CYCLE).ok_or(Error::Overflow)?;
+        sub.total_renewals = sub.total_renewals.saturating_add(1);
 
         env.storage().persistent().set(&key, &sub);
-        env.storage().persistent().extend_ttl(&key, BUMP_THRESH, BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        env.events().publish(
+            (symbol_short!("renew"), plan_id, subscriber),
+            sub.current_period_end,
+        );
         Ok(sub)
     }
 
     /// Cancel the caller's own subscription.
     ///
-    /// Requires authorisation from `subscriber`. Cancellation is idempotent in
-    /// effect: access continues until `current_period_end`, after which the
-    /// subscription is no longer active and cannot be renewed.
+    /// Requires authorisation from `subscriber`. Access continues until
+    /// `current_period_end`; the subscription can no longer be renewed.
+    /// Cancelling an already-cancelled subscription is a no-op.
     ///
     /// # Errors
     /// - [`Error::SubNotFound`] if no subscription exists for the pair.
     pub fn cancel(env: Env, plan_id: String, subscriber: Address) -> Result<(), Error> {
         subscriber.require_auth();
-        let key = DataKey::Sub(plan_id, subscriber);
+        let key = DataKey::Sub(plan_id.clone(), subscriber.clone());
         let mut sub: Subscription = env
             .storage()
             .persistent()
             .get(&key)
             .ok_or(Error::SubNotFound)?;
+        if sub.cancelled {
+            return Ok(());
+        }
         sub.cancelled = true;
         env.storage().persistent().set(&key, &sub);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        env.events()
+            .publish((symbol_short!("cancel"), plan_id, subscriber), ());
         Ok(())
     }
 
-    /// Return `true` if the subscriber currently has active access.
+    /// Return `true` if the subscriber currently has access.
     ///
-    /// Access is active when the subscription exists, is not cancelled, and
-    /// `current_period_end` is strictly greater than the current ledger
-    /// sequence. Permissionless — safe to call from any context.
+    /// Access is active when the subscription exists and `current_period_end`
+    /// is strictly greater than the current ledger sequence — including for a
+    /// cancelled subscription whose paid period has not yet ended.
+    /// Permissionless — safe to call from any context.
     pub fn is_active(env: Env, plan_id: String, subscriber: Address) -> bool {
         let key = DataKey::Sub(plan_id, subscriber);
         match env.storage().persistent().get::<_, Subscription>(&key) {
-            Some(s) => !s.cancelled && s.current_period_end > env.ledger().sequence(),
-            None    => false,
+            Some(s) => s.current_period_end > env.ledger().sequence(),
+            None => false,
         }
     }
 
@@ -340,12 +421,15 @@ impl SubscriptionManager {
     /// Admin upgrades the contract WASM. Admin only.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         Self::require_admin(&env)?;
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        env.events()
+            .publish((symbol_short!("upgrade"),), new_wasm_hash);
         Ok(())
     }
+}
 
-    // ─── Internal helpers ────────────────────────────────────────────────────
-
+impl SubscriptionManager {
     fn require_admin(env: &Env) -> Result<(), Error> {
         let admin: Address = env
             .storage()
@@ -353,19 +437,50 @@ impl SubscriptionManager {
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialised)?;
         admin.require_auth();
+        env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
         Ok(())
     }
 }
 
-
-
-
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Address, Env, String};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke},
+        Address, Env, IntoVal, String,
+    };
+
+    struct Ctx<'a> {
+        env: Env,
+        client: SubscriptionManagerClient<'a>,
+        admin: Address,
+        publisher: Address,
+        plan_id: String,
+    }
+
+    fn setup<'a>() -> Ctx<'a> {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(SubscriptionManager, ());
+        let client = SubscriptionManagerClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let publisher = Address::generate(&env);
+        let plan_id = String::from_str(&env, "plan");
+        client.init(&admin);
+        client.create_plan(&publisher, &plan_id, &1_000_000i128);
+        Ctx {
+            env,
+            client,
+            admin,
+            publisher,
+            plan_id,
+        }
+    }
+
+    fn advance(env: &Env, ledgers: u32) {
+        env.ledger()
+            .set_sequence_number(env.ledger().sequence() + ledgers);
+    }
 
     #[test]
     fn test_create_plan() {
@@ -384,6 +499,7 @@ mod tests {
         let plan = client.create_plan(&publisher, &plan_id, &10_000_000i128);
         assert_eq!(plan.price_per_cycle, 10_000_000i128);
         assert!(plan.active);
+        assert_eq!(client.get_plan(&plan_id), plan);
     }
 
     #[test]
@@ -405,5 +521,207 @@ mod tests {
         assert!(!client.is_active(&plan_id, &subscriber));
         client.subscribe(&plan_id, &subscriber);
         assert!(client.is_active(&plan_id, &subscriber));
+    }
+
+    #[test]
+    fn init_twice_is_rejected() {
+        let c = setup();
+        let attacker = Address::generate(&c.env);
+        assert_eq!(
+            c.client.try_init(&attacker),
+            Err(Ok(Error::AlreadyInitialised))
+        );
+        assert_eq!(c.client.admin(), c.admin);
+    }
+
+    #[test]
+    fn subscribe_fails_before_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = SubscriptionManagerClient::new(&env, &env.register(SubscriptionManager, ()));
+        let sub = Address::generate(&env);
+        let pid = String::from_str(&env, "p");
+        assert_eq!(client.try_admin(), Err(Ok(Error::NotInitialised)));
+        assert_eq!(
+            client.try_subscribe(&pid, &sub),
+            Err(Ok(Error::NotInitialised))
+        );
+    }
+
+    #[test]
+    fn existing_plan_cannot_be_hijacked() {
+        let c = setup();
+        let attacker = Address::generate(&c.env);
+        assert_eq!(
+            c.client.try_create_plan(&attacker, &c.plan_id, &1i128),
+            Err(Ok(Error::PlanExists))
+        );
+        assert_eq!(c.client.get_plan(&c.plan_id).publisher, c.publisher);
+    }
+
+    #[test]
+    fn non_positive_price_rejected() {
+        let c = setup();
+        let pid = String::from_str(&c.env, "free");
+        assert_eq!(
+            c.client.try_create_plan(&c.publisher, &pid, &0i128),
+            Err(Ok(Error::InvalidPrice))
+        );
+        assert_eq!(
+            c.client.try_create_plan(&c.publisher, &pid, &-1i128),
+            Err(Ok(Error::InvalidPrice))
+        );
+    }
+
+    #[test]
+    fn subscribe_by_non_admin_is_rejected() {
+        let c = setup();
+        let mallory = Address::generate(&c.env);
+        let sub = Address::generate(&c.env);
+        c.env.mock_auths(&[MockAuth {
+            address: &mallory,
+            invoke: &MockAuthInvoke {
+                contract: &c.client.address,
+                fn_name: "subscribe",
+                args: (c.plan_id.clone(), sub.clone()).into_val(&c.env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(c.client.try_subscribe(&c.plan_id, &sub).is_err());
+    }
+
+    #[test]
+    fn subscribe_missing_or_inactive_plan_fails() {
+        let c = setup();
+        let sub = Address::generate(&c.env);
+        let missing = String::from_str(&c.env, "missing");
+        assert_eq!(
+            c.client.try_subscribe(&missing, &sub),
+            Err(Ok(Error::PlanNotFound))
+        );
+        c.client.deactivate_plan(&c.plan_id);
+        assert!(!c.client.get_plan(&c.plan_id).active);
+        assert_eq!(
+            c.client.try_subscribe(&c.plan_id, &sub),
+            Err(Ok(Error::PlanInactive))
+        );
+    }
+
+    #[test]
+    fn deactivate_requires_publisher_auth() {
+        let c = setup();
+        c.client.deactivate_plan(&c.plan_id);
+        assert_eq!(c.env.auths()[0].0, c.publisher);
+    }
+
+    #[test]
+    fn double_subscribe_rejected_until_expiry() {
+        let c = setup();
+        let sub = Address::generate(&c.env);
+        c.client.subscribe(&c.plan_id, &sub);
+        assert_eq!(
+            c.client.try_subscribe(&c.plan_id, &sub),
+            Err(Ok(Error::AlreadySubbed))
+        );
+        advance(&c.env, CYCLE);
+        assert!(!c.client.is_active(&c.plan_id, &sub));
+        let s = c.client.subscribe(&c.plan_id, &sub);
+        assert_eq!(s.current_period_end, c.env.ledger().sequence() + CYCLE);
+    }
+
+    #[test]
+    fn renew_stacks_from_period_end_or_now() {
+        let c = setup();
+        let sub = Address::generate(&c.env);
+        let s = c.client.subscribe(&c.plan_id, &sub);
+
+        advance(&c.env, 10);
+        let r = c.client.renew(&c.plan_id, &sub);
+        assert_eq!(r.current_period_end, s.current_period_end + CYCLE);
+        assert_eq!(r.total_renewals, 1);
+
+        advance(&c.env, 5 * CYCLE);
+        let r2 = c.client.renew(&c.plan_id, &sub);
+        assert_eq!(r2.current_period_end, c.env.ledger().sequence() + CYCLE);
+        assert_eq!(r2.total_renewals, 2);
+    }
+
+    #[test]
+    fn renew_works_on_deactivated_plan() {
+        let c = setup();
+        let sub = Address::generate(&c.env);
+        c.client.subscribe(&c.plan_id, &sub);
+        c.client.deactivate_plan(&c.plan_id);
+        assert_eq!(c.client.renew(&c.plan_id, &sub).total_renewals, 1);
+    }
+
+    #[test]
+    fn cancel_keeps_access_until_period_end_and_blocks_renewal() {
+        let c = setup();
+        let sub = Address::generate(&c.env);
+        let s = c.client.subscribe(&c.plan_id, &sub);
+
+        c.client.cancel(&c.plan_id, &sub);
+        assert_eq!(c.env.auths()[0].0, sub);
+        assert!(c.client.get_subscription(&c.plan_id, &sub).cancelled);
+        assert!(c.client.is_active(&c.plan_id, &sub));
+        assert_eq!(
+            c.client.try_renew(&c.plan_id, &sub),
+            Err(Ok(Error::Cancelled))
+        );
+
+        // Idempotent.
+        c.client.cancel(&c.plan_id, &sub);
+
+        c.env.ledger().set_sequence_number(s.current_period_end - 1);
+        assert!(c.client.is_active(&c.plan_id, &sub));
+        advance(&c.env, 1);
+        assert!(!c.client.is_active(&c.plan_id, &sub));
+    }
+
+    #[test]
+    fn resubscribe_after_cancel_carries_over_paid_time() {
+        let c = setup();
+        let sub = Address::generate(&c.env);
+        let s = c.client.subscribe(&c.plan_id, &sub);
+        c.client.cancel(&c.plan_id, &sub);
+        advance(&c.env, 100);
+        let s2 = c.client.subscribe(&c.plan_id, &sub);
+        assert!(!s2.cancelled);
+        assert_eq!(s2.current_period_end, s.current_period_end + CYCLE);
+    }
+
+    #[test]
+    fn missing_subscription_errors() {
+        let c = setup();
+        let sub = Address::generate(&c.env);
+        assert_eq!(
+            c.client.try_renew(&c.plan_id, &sub),
+            Err(Ok(Error::SubNotFound))
+        );
+        assert_eq!(
+            c.client.try_cancel(&c.plan_id, &sub),
+            Err(Ok(Error::SubNotFound))
+        );
+        assert_eq!(
+            c.client.try_get_subscription(&c.plan_id, &sub),
+            Err(Ok(Error::SubNotFound))
+        );
+    }
+
+    #[test]
+    fn set_admin_rotates_admin() {
+        let c = setup();
+        let new_admin = Address::generate(&c.env);
+        c.client.set_admin(&new_admin);
+        assert_eq!(c.env.auths()[0].0, c.admin);
+        assert_eq!(c.client.admin(), new_admin);
+    }
+
+    #[test]
+    fn version_check() {
+        let c = setup();
+        assert_eq!(c.client.get_version(), String::from_str(&c.env, VERSION));
+        assert!(c.client.is_compatible());
     }
 }

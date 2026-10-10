@@ -1,450 +1,314 @@
-# Contracts
+# SynapsVault Contracts — Interface Reference
 
-This document is the authoritative reference for the three Soroban smart contracts that make up the platform:
+This document is the source-of-truth reference for the public interface,
+storage layout, events and error codes of each contract in this workspace.
+Keep it in sync with the code: any change to a contract's public interface,
+storage or error codes must update this file in the same pull request.
 
-| Contract | Crate | Responsibility |
-| --- | --- | --- |
-| **Vault Registry** | `vault-registry` | Registers resources and their metadata; issues and tracks leases. |
-| **Access Lease** | `access-lease` | Manages time-bounded access leases against registered resources. |
-| **Subscription** | `subscription` | Manages recurring plans and subscriber lifecycle. |
-
----
-
-## Table of Contents
-
-1. [Architecture Overview](#architecture-overview)
-2. [Access Control Model](#access-control-model)
-3. [Admin Role](#admin-role)
-4. [Vault Registry Contract](#vault-registry-contract)
-5. [Access Lease Contract](#access-lease-contract)
-6. [Subscription Contract](#subscription-contract)
-7. [Cross-Contract Interactions](#cross-contract-interactions)
-8. [Usage Examples](#usage-examples)
+- [Common conventions](#common-conventions)
+- [vault-registry](#vault-registry)
+- [access-lease](#access-lease)
+- [subscription](#subscription)
 
 ---
 
-## Architecture Overview
+## Common conventions
 
-The three contracts are designed to be composed. The **Vault Registry** is the source of truth for what resources exist and who owns them. The **Access Lease** contract consumes registry data to grant time-bounded access. The **Subscription** contract consumes registry data to grant recurring access tied to a billing plan.
+| Topic | Convention |
+|---|---|
+| Amounts | `i128` USDC stroops (7 decimals). Always strictly positive. |
+| Time | Ledger sequence numbers (`u32`). ~5 s per ledger, 17,280 ledgers ≈ 1 day. |
+| Admin | A single admin address held in instance storage, set once by `init`. In production this is the backend platform wallet. |
+| `init` | One-time. A second call fails with `AlreadyInitialised` — it can never overwrite the admin. `init` does not require the admin's signature, so deploy and init in the same pipeline run. |
+| Admin rotation | `set_admin(new_admin)` on `access-lease` and `subscription`, gated by the current admin. |
+| Upgrades | `upgrade(new_wasm_hash)` — admin-only; storage is preserved. |
+| Versioning | `get_version()` returns the version recorded at `init` (crate version); `is_compatible(...)` detects stale deployments. |
+| Errors | Every fallible entrypoint returns `Result<_, Error>`; codes are stable and never renumbered. |
 
-```
-                 +----------------------+
-                 |    Vault Registry    |
-                 |  (resources, leases) |
-                 +----------+-----------+
-                            |
-          +-----------------+-----------------+
-          |                                   |
-          v                                   v
-  +---------------+                   +----------------+
-  | Access Lease  |                   |  Subscription  |
-  | (time-bound)  |                   |  (recurring)   |
-  +---------------+                   +----------------+
-```
-
-Key design principles:
-
-- **Single source of truth.** Resource metadata and ownership live only in the Vault Registry. The other contracts read from it and never duplicate it.
-- **Explicit authorization.** Every state-mutating entry point requires an `Address` signature via `require_auth`.
-- **Bounded storage.** All persistent entries carry a TTL that is bumped on access to avoid archival.
-- **Monotonic identifiers.** Counters used for IDs only ever increase; IDs are never reused.
-
----
-
-## Access Control Model
-
-Authorization is enforced at two levels:
-
-1. **Contract-level admin.** Each contract stores an `admin: Address` in instance storage. Admin-only functions call `admin.require_auth()` and compare the caller against the stored admin.
-2. **Resource-level owner.** The Vault Registry stores an `owner: Address` per resource. Owner-only functions (e.g. updating metadata, revoking leases) call `owner.require_auth()` and verify the caller owns the resource.
-
-Roles summary:
+### Roles
 
 | Role | Capabilities |
-| --- | --- |
-| **Admin** | Initialize contracts, set/rotate admin, pause/unpause, upgrade. |
-| **Resource Owner** | Register resources, update metadata, revoke leases, deactivate resources. |
-| **Lessee / Subscriber** | Acquire leases, renew, cancel their own leases/subscriptions. |
-| **Public** | Read-only queries (get resource, list leases, check status). |
+|---|---|
+| **Admin** | Initialise-time owner. Upgrades contracts, rotates itself, grants/extends/revokes leases, subscribes/renews subscribers. |
+| **Creator** (`vault-registry`) | Registers resources and is the only one able to mutate them; may transfer ownership. |
+| **Publisher** (`subscription`) | Creates and deactivates their own plans. |
+| **Buyer / Subscriber** | Holds leases/subscriptions; a subscriber can cancel their own subscription. |
+| **Anyone** | All read-only entrypoints (`get`, `list`, `is_valid`, `is_active`, …) are permissionless. |
 
 ---
 
-## Admin Role
+## vault-registry
 
-Each contract exposes the following admin surface:
+On-chain registry of vault resources: creator, price, metadata pointer, tags
+and listing status. Payment itself happens off-contract (x402 + USDC SAC); the
+registry is the transparent source of truth for *what* exists, *who* owns it
+and *what it costs*.
 
-| Function | Description |
-| --- | --- |
-| `initialize(admin)` | One-time setup. Stores the admin address. Panics if already initialized. |
-| `set_admin(new_admin)` | Rotates the admin. Requires current admin auth. |
-| `get_admin()` | Returns the current admin address. |
-| `pause()` / `unpause()` | Toggles a global pause flag. Mutating entry points check this flag. |
-| `is_paused()` | Returns the pause state. |
-
-The admin is stored in **instance storage** under the key `DataKey::Admin` and is bumped with the instance TTL on every contract invocation.
-
----
-
-## Vault Registry Contract
-
-### Purpose
-
-The Vault Registry is the canonical registry of resources. It stores resource metadata, ownership, and the set of leases associated with each resource. It is the only contract permitted to mint lease IDs.
-
-### State Structures
-
-#### `Resource`
+### Data
 
 ```rust
 pub struct Resource {
-    pub id: u64,               // Monotonic identifier
-    pub owner: Address,        // Owner authorized to mutate this resource
-    pub name: String,          // Human-readable name
-    pub uri: String,           // Off-chain metadata URI
-    pub active: bool,          // Whether new leases may be issued
-    pub created_at: u64,       // Ledger timestamp of creation
-    pub updated_at: u64,       // Ledger timestamp of last update
+    pub id: String,         // unique, immutable
+    pub creator: Address,   // only address allowed to mutate the resource
+    pub price: i128,        // USDC stroops, > 0
+    pub metadata: String,   // IPFS URI / content hash, <= 512 bytes
+    pub listed: bool,       // true on register
+    pub tags: Vec<String>,  // <= 8 tags, each 1..=32 bytes
 }
 ```
 
-#### `Lease`
+| Constant | Value |
+|---|---|
+| `MAX_METADATA_POINTER_LEN` | 512 bytes |
+| `MAX_TAGS` | 8 |
+| `MAX_TAG_LEN` | 32 bytes |
+| `MAX_PAGE_SIZE` | 20 |
 
-```rust
-pub struct Lease {
-    pub id: u64,               // Monotonic identifier
-    pub resource_id: u64,      // Reference to Resource.id
-    pub lessee: Address,       // Holder of the lease
-    pub start: u64,            // Ledger timestamp when the lease begins
-    pub end: u64,              // Ledger timestamp when the lease expires
-    pub revoked: bool,         // Set to true when the owner revokes
-}
-```
+### Functions
 
-### Storage Keys
+| Function | Auth | Returns | Errors |
+|---|---|---|---|
+| `init(admin)` | — (one-time) | `()` | `AlreadyInitialised` |
+| `admin()` | — | `Address` | `NotInitialised` |
+| `upgrade(new_wasm_hash)` | Admin | `()` | `NotInitialised` |
+| `register(creator, id, price, metadata, tags)` | `creator` | `()` | `InvalidPrice`, `MetadataTooLong`, `InvalidTag`, `AlreadyRegistered` |
+| `set_price(id, new_price)` | Creator | `()` | `InvalidPrice`, `NotFound` |
+| `update_metadata(id, metadata)` | Creator | `()` | `NotFound`, `MetadataTooLong` |
+| `set_tags(id, tags)` | Creator | `()` | `InvalidTag`, `NotFound` |
+| `transfer_ownership(id, new_creator)` | Creator | `()` | `NotFound` |
+| `set_listed(id, listed)` | Creator | `()` | `NotFound` |
+| `delist(id)` | Creator | `()` | `NotFound` |
+| `list(start, limit)` | — | `Vec<Resource>` | — (`limit` capped at 20) |
+| `get(id)` | — | `Resource` | `NotFound` |
+| `exists(id)` | — | `bool` | — |
+| `get_owner(id)` | — | `Address` | `NotFound` |
+| `count()` | — | `u32` | — |
+| `version()` | — | `String` (compiled version) | — |
+| `get_version()` | — | `String` (version stored at `init`) | — |
+| `is_compatible(version)` | — | `bool` — major.minor matches | — |
 
-```rust
-pub enum DataKey {
-    Admin,                     // Instance: Address
-    Paused,                    // Instance: bool
-    ResourceCount,             // Instance: u64
-    LeaseCount,                // Instance: u64
-    Resource(u64),             // Persistent: Resource
-    Lease(u64),                // Persistent: Lease
-    ResourceLeases(u64),       // Persistent: Vec<u64>
-}
-```
+The registry itself works without `init`; the admin is only needed for `upgrade`.
 
-### TTLs
+### Storage
 
-| Storage | Constant | Value (ledgers) | Bump policy |
-| --- | --- | --- | --- |
-| Instance | `INSTANCE_TTL` | 30 days | Bumped on every invocation. |
-| Persistent (Resource) | `RESOURCE_TTL` | 60 days | Bumped on read and write. |
-| Persistent (Lease) | `LEASE_TTL` | 30 days | Bumped on read and write. |
-| Persistent (ResourceLeases) | `RESOURCE_TTL` | 60 days | Bumped on read and write. |
+| Key | Storage | Value | TTL |
+|---|---|---|---|
+| `Resource(id)` | persistent | `Resource` | bumped to 30 days on every write |
+| `Index(i)` | persistent | resource id (insertion order) | bumped to 30 days on write |
+| `Count` | instance | `u32`, monotonic | instance bumped on write |
+| `Admin` | instance | `Address` | — |
+| `Version` | instance | `String` | — |
 
-### Function Reference
+### Events
 
-| Function | Parameters | Returns | Auth | Errors |
-| --- | --- | --- | --- | --- |
-| `initialize` | `admin: Address` | `()` | None (one-time) | `AlreadyInitialized` |
-| `set_admin` | `new_admin: Address` | `()` | Admin | `NotAuthorized` |
-| `get_admin` | — | `Address` | None | `NotInitialized` |
-| `pause` | — | `()` | Admin | `NotAuthorized` |
-| `unpause` | — | `()` | Admin | `NotAuthorized` |
-| `is_paused` | — | `bool` | None | — |
-| `register_resource` | `owner: Address, name: String, uri: String` | `u64` | Owner | `Paused`, `InvalidInput` |
-| `update_resource` | `owner: Address, id: u64, name: String, uri: String` | `()` | Owner | `NotFound`, `NotAuthorized`, `Paused` |
-| `deactivate_resource` | `owner: Address, id: u64` | `()` | Owner | `NotFound`, `NotAuthorized` |
-| `get_resource` | `id: u64` | `Resource` | None | `NotFound` |
-| `list_resources` | `start: u64, limit: u32` | `Vec<Resource>` | None | — |
-| `issue_lease` | `owner: Address, resource_id: u64, lessee: Address, start: u64, end: u64` | `u64` | Owner | `NotFound`, `NotAuthorized`, `ResourceInactive`, `InvalidInput`, `Paused` |
-| `revoke_lease` | `owner: Address, lease_id: u64` | `()` | Owner | `NotFound`, `NotAuthorized` |
-| `get_lease` | `lease_id: u64` | `Lease` | None | `NotFound` |
-| `list_leases` | `resource_id: u64` | `Vec<u64>` | None | `NotFound` |
-| `is_lease_active` | `lease_id: u64` | `bool` | None | `NotFound` |
+| Topics | Data |
+|---|---|
+| `("init",)` | admin |
+| `("register", creator)` | id |
+| `("setprice", id)` | new price |
+| `("updmeta", id)` | `()` |
+| `("settags", id)` | tags |
+| `("transfer", id)` | new creator |
+| `("setlisted", id)` | listed |
+| `("upgrade",)` | new wasm hash |
 
-### Error Codes
+### Errors
 
 | Code | Name | Meaning |
-| --- | --- | --- |
-| 1 | `AlreadyInitialized` | `initialize` called more than once. |
-| 2 | `NotInitialized` | Contract used before `initialize`. |
-| 3 | `NotAuthorized` | Caller failed `require_auth` or is not the owner/admin. |
-| 4 | `NotFound` | Referenced resource or lease does not exist. |
-| 5 | `ResourceInactive` | Attempted to issue a lease against an inactive resource. |
-| 6 | `InvalidInput` | Empty name/URI, or `end <= start`. |
-| 7 | `Paused` | Contract is paused. |
-
-### Invariants
-
-- **Monotonic count.** `ResourceCount` and `LeaseCount` only increase. IDs are never reused, even after revocation.
-- **TTL bumping.** Every read or write of a persistent entry extends its TTL to the configured value.
-- **Active-lease check.** `issue_lease` fails if the resource is inactive or if `end <= start`.
-- **Owner consistency.** Only the stored `owner` of a resource may mutate it or issue/revoke its leases.
-- **Lease linkage.** Every `Lease.resource_id` refers to an existing `Resource`, and the lease ID appears in `ResourceLeases(resource_id)`.
+|---|---|---|
+| 1 | `AlreadyRegistered` | `id` already exists. |
+| 2 | `NotFound` | No resource with `id`. |
+| 3 | `InvalidPrice` | Price ≤ 0. |
+| 4 | `MetadataTooLong` | Metadata > 512 bytes. |
+| 5 | `InvalidTag` | > 8 tags, or a tag is empty / > 32 bytes. |
+| 6 | `NotAdmin` | Reserved. |
+| 7 | `NotInitialised` | Admin-only call before `init`. |
+| 8 | `AlreadyInitialised` | `init` called twice. |
 
 ---
 
-## Access Lease Contract
+## access-lease
 
-### Purpose
+Time-limited access grants. The backend issues a `Lease` with an `expires_at`
+ledger; any party can verify access with a single permissionless read.
 
-The Access Lease contract provides a thin, composable interface for acquiring and renewing time-bounded leases. It delegates resource validation to the Vault Registry and stores only the lease-to-holder mapping it needs.
-
-### State Structures
-
-#### `Lease`
+### Data
 
 ```rust
 pub struct Lease {
-    pub id: u64,               // Local monotonic identifier
-    pub registry_lease_id: u64,// Lease ID in the Vault Registry
-    pub resource_id: u64,      // Reference to Resource.id
-    pub lessee: Address,       // Holder
-    pub start: u64,
-    pub end: u64,
-    pub renewed_at: u64,       // Last renewal timestamp
+    pub resource_id: String,
+    pub buyer: Address,
+    pub granted_at: u32,       // ledger of grant
+    pub expires_at: u32,       // exclusive
+    pub duration_ledgers: u32, // as originally requested
 }
 ```
 
-### Storage Keys
+A lease is **valid** iff it exists and `expires_at > ledger.sequence()`.
 
-```rust
-pub enum DataKey {
-    Admin,                     // Instance: Address
-    Paused,                    // Instance: bool
-    LeaseCount,                // Instance: u64
-    Lease(u64),                // Persistent: Lease
-    LesseeLeases(Address),     // Persistent: Vec<u64>
-}
-```
+### Functions
 
-### TTLs
+| Function | Auth | Returns | Errors |
+|---|---|---|---|
+| `init(admin)` | — (one-time) | `()` | `AlreadyInitialised` |
+| `admin()` | — | `Address` | `NotInitialised` |
+| `set_admin(new_admin)` | Admin | `()` | `NotInitialised` |
+| `grant_lease(resource_id, buyer, duration_ledgers)` | Admin | `Lease` | `NotInitialised`, `InvalidDuration`, `AlreadyActive` |
+| `extend_lease(resource_id, buyer, extra_ledgers)` | Admin | `Lease` | `NotInitialised`, `InvalidDuration`, `LeaseNotFound` |
+| `revoke_lease(resource_id, buyer)` | Admin | `()` | `NotInitialised`, `LeaseNotFound` |
+| `is_valid(resource_id, buyer)` | — | `bool` | — |
+| `get_lease(resource_id, buyer)` | — | `Lease` (even if expired) | `LeaseNotFound` |
+| `get_version()` | — | `String` | — |
+| `is_compatible()` | — | `bool` — stored version == compiled | — |
+| `upgrade(new_wasm_hash)` | Admin | `()` | `NotInitialised` |
 
-| Storage | Constant | Value (ledgers) | Bump policy |
-| --- | --- | --- | --- |
-| Instance | `INSTANCE_TTL` | 30 days | Bumped on every invocation. |
-| Persistent (Lease) | `LEASE_TTL` | 30 days | Bumped on read and write. |
-| Persistent (LesseeLeases) | `LEASE_TTL` | 30 days | Bumped on read and write. |
+**Semantics**
 
-### Function Reference
+- `grant_lease` rejects a zero duration and any duration whose expiry would
+  overflow `u32`. An expired lease may be replaced by a new grant.
+- `extend_lease` computes `max(expires_at, now) + extra_ledgers`, so an expired
+  lease restarts from the current ledger. Zero / overflowing extensions are rejected.
+- `revoke_lease` deletes the record.
 
-| Function | Parameters | Returns | Auth | Errors |
-| --- | --- | --- | --- | --- |
-| `initialize` | `admin: Address, registry: Address` | `()` | None (one-time) | `AlreadyInitialized` |
-| `set_admin` | `new_admin: Address` | `()` | Admin | `NotAuthorized` |
-| `get_admin` | — | `Address` | None | `NotInitialized` |
-| `pause` / `unpause` | — | `()` | Admin | `NotAuthorized` |
-| `is_paused` | — | `bool` | None | — |
-| `acquire` | `lessee: Address, resource_id: u64, duration: u64` | `u64` | Lessee | `NotFound`, `ResourceInactive`, `InvalidInput`, `Paused` |
-| `renew` | `lessee: Address, lease_id: u64, duration: u64` | `()` | Lessee | `NotFound`, `NotAuthorized`, `InvalidInput`, `Paused` |
-| `cancel` | `lessee: Address, lease_id: u64` | `()` | Lessee | `NotFound`, `NotAuthorized` |
-| `get_lease` | `lease_id: u64` | `Lease` | None | `NotFound` |
-| `list_lessee_leases` | `lessee: Address` | `Vec<u64>` | None | — |
-| `is_active` | `lease_id: u64` | `bool` | None | `NotFound` |
+### Storage
 
-### Error Codes
+| Key | Storage | Value | TTL |
+|---|---|---|---|
+| `Admin` | instance | `Address` | instance bumped to 90 days on admin calls |
+| `Version` | instance | `String` | — |
+| `Lease(resource_id, buyer)` | persistent | `Lease` | bumped to 90 days on write |
+
+### Events
+
+| Topics | Data |
+|---|---|
+| `("init",)` | admin |
+| `("setadmin",)` | new admin |
+| `("grant", resource_id, buyer)` | `expires_at` |
+| `("extend", resource_id, buyer)` | new `expires_at` |
+| `("revoke", resource_id, buyer)` | `()` |
+| `("upgrade",)` | new wasm hash |
+
+### Errors
 
 | Code | Name | Meaning |
-| --- | --- | --- |
-| 1 | `AlreadyInitialized` | `initialize` called more than once. |
-| 2 | `NotInitialized` | Contract used before `initialize`. |
-| 3 | `NotAuthorized` | Caller is not the lessee or admin. |
-| 4 | `NotFound` | Lease or resource does not exist. |
-| 5 | `ResourceInactive` | Registry reports the resource as inactive. |
-| 6 | `InvalidInput` | `duration == 0`. |
-| 7 | `Paused` | Contract is paused. |
-
-### Invariants
-
-- **Monotonic count.** `LeaseCount` only increases.
-- **TTL bumping.** Persistent entries are bumped on read and write.
-- **Active-lease check.** `renew` fails if the lease has already expired; `is_active` returns `false` for expired or cancelled leases.
-- **Registry linkage.** Every local lease references a valid `registry_lease_id`; the registry is the authority on resource state.
-- **Lessee index consistency.** Every lease ID appears in `LesseeLeases(lessee)`.
+|---|---|---|
+| 1 | `NotAdmin` | Reserved. |
+| 2 | `LeaseNotFound` | No lease for the pair. |
+| 3 | `AlreadyActive` | An unexpired lease already exists. |
+| 4 | `InvalidDuration` | Zero duration, or expiry would overflow. |
+| 5 | `NotInitialised` | Admin-only call before `init`. |
+| 6 | `UpgradeNotAllowed` | Reserved. |
+| 7 | `AlreadyInitialised` | `init` called twice. |
 
 ---
 
-## Subscription Contract
+## subscription
 
-### Purpose
+Recurring 30-day subscription plans. Publishers define plans; the backend
+subscribes buyers after payment and renews each cycle. Subscribers can
+self-cancel and keep access through the end of the paid period.
 
-The Subscription contract manages recurring plans. A plan defines a resource, a price, and a billing period. Subscribers enroll in a plan and are billed per period; access is granted while the subscription is active.
-
-### State Structures
-
-#### `Plan`
+### Data
 
 ```rust
 pub struct Plan {
-    pub id: u64,               // Monotonic identifier
-    pub owner: Address,        // Plan owner (resource owner)
-    pub resource_id: u64,      // Reference to Resource.id
-    pub price: i128,           // Price per period, in stroops
-    pub period: u64,           // Billing period in seconds
-    pub active: bool,          // Whether new subscriptions may be created
-    pub created_at: u64,
+    pub plan_id: String,
+    pub publisher: Address,
+    pub price_per_cycle: i128, // USDC stroops, > 0
+    pub active: bool,          // false => no new subscriptions
 }
-```
 
-#### `Subscription`
-
-```rust
 pub struct Subscription {
-    pub id: u64,               // Monotonic identifier
-    pub plan_id: u64,          // Reference to Plan.id
-    pub subscriber: Address,   // Subscriber
-    pub started_at: u64,       // Enrollment timestamp
-    pub paid_until: u64,       // Timestamp through which the subscription is paid
-    pub cancelled: bool,       // Set when the subscriber cancels
+    pub plan_id: String,
+    pub subscriber: Address,
+    pub started_at: u32,
+    pub current_period_end: u32,
+    pub cancelled: bool,       // blocks renewals; access runs to period end
+    pub total_renewals: u32,
 }
 ```
 
-### Storage Keys
+`CYCLE` = 30 days = 518,400 ledgers. A subscription is **active** iff it exists
+and `current_period_end > ledger.sequence()` — this includes cancelled
+subscriptions whose paid period has not yet ended.
 
-```rust
-pub enum DataKey {
-    Admin,                     // Instance: Address
-    Paused,                    // Instance: bool
-    PlanCount,                 // Instance: u64
-    SubscriptionCount,         // Instance: u64
-    Plan(u64),                 // Persistent: Plan
-    Subscription(u64),         // Persistent: Subscription
-    SubscriberSubs(Address),   // Persistent: Vec<u64>
-}
-```
+### Functions
 
-### TTLs
+| Function | Auth | Returns | Errors |
+|---|---|---|---|
+| `init(admin)` | — (one-time) | `()` | `AlreadyInitialised` |
+| `admin()` | — | `Address` | `NotInitialised` |
+| `set_admin(new_admin)` | Admin | `()` | `NotInitialised` |
+| `create_plan(publisher, plan_id, price_per_cycle)` | `publisher` | `Plan` | `InvalidPrice`, `PlanExists` |
+| `get_plan(plan_id)` | — | `Plan` | `PlanNotFound` |
+| `deactivate_plan(plan_id)` | Publisher | `()` | `PlanNotFound` |
+| `subscribe(plan_id, subscriber)` | Admin | `Subscription` | `NotInitialised`, `PlanNotFound`, `PlanInactive`, `AlreadySubbed`, `Overflow` |
+| `renew(plan_id, subscriber)` | Admin | `Subscription` | `NotInitialised`, `SubNotFound`, `Cancelled`, `Overflow` |
+| `cancel(plan_id, subscriber)` | `subscriber` | `()` (idempotent) | `SubNotFound` |
+| `is_active(plan_id, subscriber)` | — | `bool` | — |
+| `get_subscription(plan_id, subscriber)` | — | `Subscription` | `SubNotFound` |
+| `get_version()` | — | `String` | — |
+| `is_compatible()` | — | `bool` | — |
+| `upgrade(new_wasm_hash)` | Admin | `()` | `NotInitialised` |
 
-| Storage | Constant | Value (ledgers) | Bump policy |
-| --- | --- | --- | --- |
-| Instance | `INSTANCE_TTL` | 30 days | Bumped on every invocation. |
-| Persistent (Plan) | `PLAN_TTL` | 60 days | Bumped on read and write. |
-| Persistent (Subscription) | `SUBSCRIPTION_TTL` | 30 days | Bumped on read and write. |
-| Persistent (SubscriberSubs) | `SUBSCRIPTION_TTL` | 30 days | Bumped on read and write. |
+**Semantics**
 
-### Function Reference
+- `subscribe` is rejected while a non-cancelled subscription is still in its
+  paid period. Re-subscribing after a cancel carries over any remaining paid
+  time (`max(current_period_end, now) + CYCLE`).
+- `renew` stacks from `max(current_period_end, now)`, and keeps working after
+  the plan is deactivated.
+- Plan ids are first-come-first-served; an existing plan can never be overwritten.
 
-| Function | Parameters | Returns | Auth | Errors |
-| --- | --- | --- | --- | --- |
-| `initialize` | `admin: Address` | `()` | None (one-time) | `AlreadyInitialized` |
-| `set_admin` | `new_admin: Address` | `()` | Admin | `NotAuthorized` |
-| `get_admin` | — | `Address` | None | `NotInitialized` |
-| `pause` / `unpause` | — | `()` | Admin | `NotAuthorized` |
-| `is_paused` | — | `bool` | None | — |
-| `create_plan` | `owner: Address, resource_id: u64, price: i128, period: u64` | `u64` | Owner | `NotFound`, `InvalidInput`, `Paused` |
-| `update_plan` | `owner: Address, plan_id: u64, price: i128, period: u64` | `()` | Owner | `NotFound`, `NotAuthorized`, `InvalidInput` |
-| `deactivate_plan` | `owner: Address, plan_id: u64` | `()` | Owner | `NotFound`, `NotAuthorized` |
-| `get_plan` | `plan_id: u64` | `Plan` | None | `NotFound` |
-| `subscribe` | `subscriber: Address, plan_id: u64` | `u64` | Subscriber | `NotFound`, `PlanInactive`, `Paused` |
-| `renew_subscription` | `subscriber: Address, subscription_id: u64` | `()` | Subscriber | `NotFound`, `NotAuthorized`, `Cancelled`, `Paused` |
-| `cancel_subscription` | `subscriber: Address, subscription_id: u64` | `()` | Subscriber | `NotFound`, `NotAuthorized` |
-| `get_subscription` | `subscription_id: u64` | `Subscription` | None | `NotFound` |
-| `list_subscriber_subs` | `subscriber: Address` | `Vec<u64>` | None | — |
-| `is_subscription_active` | `subscription_id: u64` | `bool` | None | `NotFound` |
+### Storage
 
-### Error Codes
+| Key | Storage | Value | TTL |
+|---|---|---|---|
+| `Admin` | instance | `Address` | instance bumped to 1 year on admin calls |
+| `Version` | instance | `String` | — |
+| `Plan(plan_id)` | persistent | `Plan` | bumped to 1 year on write |
+| `Sub(plan_id, subscriber)` | persistent | `Subscription` | bumped to 1 year on write |
+
+### Events
+
+| Topics | Data |
+|---|---|
+| `("init",)` | admin |
+| `("setadmin",)` | new admin |
+| `("plan", plan_id, publisher)` | price per cycle |
+| `("deactiv", plan_id)` | `()` |
+| `("subscribe", plan_id, subscriber)` | `current_period_end` |
+| `("renew", plan_id, subscriber)` | new `current_period_end` |
+| `("cancel", plan_id, subscriber)` | `()` |
+| `("upgrade",)` | new wasm hash |
+
+### Errors
 
 | Code | Name | Meaning |
-| --- | --- | --- |
-| 1 | `AlreadyInitialized` | `initialize` called more than once. |
-| 2 | `NotInitialized` | Contract used before `initialize`. |
-| 3 | `NotAuthorized` | Caller is not the owner, subscriber, or admin. |
-| 4 | `NotFound` | Plan or subscription does not exist. |
-| 5 | `PlanInactive` | Attempted to subscribe to an inactive plan. |
-| 6 | `InvalidInput` | `price <= 0` or `period == 0`. |
-| 7 | `Paused` | Contract is paused. |
-| 8 | `Cancelled` | Operation attempted on a cancelled subscription. |
-
-### Invariants
-
-- **Monotonic count.** `PlanCount` and `SubscriptionCount` only increase.
-- **TTL bumping.** Persistent entries are bumped on read and write.
-- **Active-lease check.** `is_subscription_active` returns `true` only when `paid_until >= now` and `cancelled == false`.
-- **Plan ownership.** Only the plan owner may update or deactivate a plan.
-- **Subscriber index consistency.** Every subscription ID appears in `SubscriberSubs(subscriber)`.
-- **Paid-until monotonicity.** `paid_until` never decreases; renewals extend it by exactly one period.
+|---|---|---|
+| 1 | `NotAdmin` | Reserved. |
+| 2 | `PlanNotFound` | No plan with `plan_id`. |
+| 3 | `PlanInactive` | Plan deactivated; no new subscriptions. |
+| 4 | `AlreadySubbed` | Active, non-cancelled subscription exists. |
+| 5 | `SubNotFound` | No subscription for the pair. |
+| 6 | `Cancelled` | Cannot renew a cancelled subscription. |
+| 7 | `InvalidPrice` | Price ≤ 0. |
+| 8 | `NotInitialised` | Admin-only call before `init`. |
+| 9 | `AlreadyInitialised` | `init` called twice. |
+| 10 | `PlanExists` | `plan_id` already taken. |
+| 11 | `Overflow` | Period end would overflow `u32`. |
 
 ---
 
-## Cross-Contract Interactions
-
-| Caller | Callee | Purpose |
-| --- | --- | --- |
-| Access Lease | Vault Registry | Validate resource existence and active status before issuing a lease. |
-| Subscription | Vault Registry | Validate resource existence before creating a plan. |
-| Vault Registry | — | No outbound calls; it is the leaf dependency. |
-
-Contracts are wired together at initialization time via the `registry` address passed to `Access Lease::initialize`. The Subscription contract reads the registry address from its own instance storage (set at initialization).
-
----
-
-## Usage Examples
-
-### Register a resource and issue a lease
+## Example (Rust test client)
 
 ```rust
-// 1. Register a resource owned by `alice`.
-let resource_id = registry.register_resource(&alice, &"Dataset A".into(), &"ipfs://...".into());
+let env = Env::default();
+env.mock_all_auths();
 
-// 2. Issue a 7-day lease to `bob`.
-let now = env.ledger().timestamp();
-let lease_id = registry.issue_lease(
-    &alice,
-    &resource_id,
-    &bob,
-    &now,
-    &(now + 7 * 24 * 60 * 60),
-);
-
-// 3. Verify the lease is active.
-assert!(registry.is_lease_active(&lease_id));
+let lease = AccessLeaseClient::new(&env, &env.register(AccessLease, ()));
+lease.init(&admin);
+lease.grant_lease(&String::from_str(&env, "res_1"), &buyer, &17_280); // 1 day
+assert!(lease.is_valid(&String::from_str(&env, "res_1"), &buyer));
 ```
-
-### Acquire and renew an access lease
-
-```rust
-// Acquire a 1-day lease through the Access Lease contract.
-let lease_id = access_lease.acquire(&bob, &resource_id, &(24 * 60 * 60));
-
-// Renew for another day.
-access_lease.renew(&bob, &lease_id, &(24 * 60 * 60));
-
-// Cancel.
-access_lease.cancel(&bob, &lease_id);
-```
-
-### Create a plan and subscribe
-
-```rust
-// Owner creates a monthly plan priced at 100 XLM (in stroops).
-let plan_id = subscription.create_plan(
-    &alice,
-    &resource_id,
-    &1_000_000_000,
-    &(30 * 24 * 60 * 60),
-);
-
-// Bob subscribes.
-let sub_id = subscription.subscribe(&bob, &plan_id);
-
-// Renew for another period.
-subscription.renew_subscription(&bob, &sub_id);
-
-// Check status.
-assert!(subscription.is_subscription_active(&sub_id));
-```
-
-### Admin operations
-
-```rust
-// Rotate the admin.
-registry.set_admin(&new_admin);
-
-// Pause all mutations during an incident.
-registry.pause();
-assert!(registry.is_paused());
-
-// Resume.
-registry.unpause();

@@ -8,15 +8,20 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: write
+
 jobs:
   confirm:
     name: Confirmation Gate
     runs-on: ubuntu-latest
     steps:
       - name: Verify confirmation input
+        env:
+          CONFIRM: ${{ github.event.inputs.confirm }}
         run: |
-          if [ "${{ github.event.inputs.confirm }}" != "deploy-mainnet" ]; then
-            echo "Confirmation failed. You must type 'deploy-mainnet' to proceed."
+          if [ "$CONFIRM" != "deploy-mainnet" ]; then
+            echo "::error::Confirmation failed. You must type 'deploy-mainnet' to proceed."
             exit 1
           fi
           echo "Confirmation accepted. Proceeding with mainnet deployment."
@@ -26,103 +31,97 @@ jobs:
     needs: confirm
     runs-on: ubuntu-latest
     environment: mainnet
+    timeout-minutes: 30
     env:
       NETWORK: mainnet
       RPC_URL: https://soroban-mainnet.stellar.org
       NETWORK_PASSPHRASE: "Public Global Stellar Network ; September 2015"
       DEPLOYER_SECRET: ${{ secrets.MAINNET_DEPLOYER_SECRET }}
+      ADMIN_PUBLIC: ${{ secrets.MAINNET_ADMIN_PUBLIC }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Check secrets
+        run: |
+          for v in DEPLOYER_SECRET ADMIN_PUBLIC; do
+            if [ -z "${!v}" ]; then
+              echo "::error::$v is not configured for the mainnet environment"
+              exit 1
+            fi
+          done
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          targets: wasm32v1-none
 
-      - name: Install Soroban CLI
+      - name: Install Stellar CLI v27
         run: |
-          cargo install --locked soroban-cli
+          curl -sL \
+            https://github.com/stellar/stellar-cli/releases/download/v27.0.0/stellar-cli-27.0.0-x86_64-unknown-linux-gnu.tar.gz \
+            | tar xz -C /usr/local/bin
+          stellar --version
+
+      - name: Test contracts
+        run: cargo test --locked --workspace
 
       - name: Build contracts
         run: |
-          cargo build --target wasm32-unknown-unknown --release
+          cargo build --locked --target wasm32v1-none --release --workspace
+          ls -lh target/wasm32v1-none/release/*.wasm
 
-      - name: Configure Soroban CLI
+      - name: Configure network
         run: |
-          soroban config network add "$NETWORK" \
+          stellar network add "$NETWORK" \
             --rpc-url "$RPC_URL" \
-            --network-passphrase "$NETWORK_PASSPHRASE"
+            --network-passphrase "$NETWORK_PASSPHRASE" 2>/dev/null || true
 
-      - name: Deploy access-lease contract
-        id: deploy_access_lease
+      - name: Deploy + init contracts
         run: |
-          ACCESS_LEASE_ID=$(soroban contract deploy \
-            --network "$NETWORK" \
-            --source "$DEPLOYER_SECRET" \
-            --wasm target/wasm32-unknown-unknown/release/access_lease.wasm)
-          echo "ACCESS_LEASE_ID=$ACCESS_LEASE_ID" >> "$GITHUB_ENV"
-          echo "access_lease_id=$ACCESS_LEASE_ID" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          for PKG in vault_registry access_lease subscription; do
+            ID=$(stellar contract deploy \
+              --wasm "target/wasm32v1-none/release/${PKG}.wasm" \
+              --source-account "$DEPLOYER_SECRET" \
+              --network "$NETWORK")
+            echo "::notice::${PKG}=${ID}"
+            stellar contract invoke \
+              --id "$ID" \
+              --source-account "$DEPLOYER_SECRET" \
+              --network "$NETWORK" \
+              -- init --admin "$ADMIN_PUBLIC"
+            VAR=$(echo "$PKG" | tr '[:lower:]' '[:upper:]')
+            echo "${VAR}=${ID}" >> "$GITHUB_ENV"
+          done
 
-      - name: Deploy subscription contract
-        id: deploy_subscription
+      - name: Write contract IDs
         run: |
-          SUBSCRIPTION_ID=$(soroban contract deploy \
-            --network "$NETWORK" \
-            --source "$DEPLOYER_SECRET" \
-            --wasm target/wasm32-unknown-unknown/release/subscription.wasm)
-          echo "SUBSCRIPTION_ID=$SUBSCRIPTION_ID" >> "$GITHUB_ENV"
-          echo "subscription_id=$SUBSCRIPTION_ID" >> "$GITHUB_OUTPUT"
-
-      - name: Deploy third contract
-        id: deploy_third
-        run: |
-          THIRD_ID=$(soroban contract deploy \
-            --network "$NETWORK" \
-            --source "$DEPLOYER_SECRET" \
-            --wasm target/wasm32-unknown-unknown/release/third_contract.wasm)
-          echo "THIRD_ID=$THIRD_ID" >> "$GITHUB_ENV"
-          echo "third_id=$THIRD_ID" >> "$GITHUB_OUTPUT"
-
-      - name: Initialize access-lease contract
-        run: |
-          soroban contract invoke \
-            --network "$NETWORK" \
-            --source "$DEPLOYER_SECRET" \
-            --id "$ACCESS_LEASE_ID" \
-            -- init
-
-      - name: Initialize subscription contract
-        run: |
-          soroban contract invoke \
-            --network "$NETWORK" \
-            --source "$DEPLOYER_SECRET" \
-            --id "$SUBSCRIPTION_ID" \
-            -- init
-
-      - name: Write contract IDs to deployed/contract-ids.env
-        run: |
+          VERSION_OF() {
+            cargo metadata --no-deps --format-version 1 \
+              | jq -r --arg pkg "$1" '.packages[] | select(.name == $pkg) | .version'
+          }
           mkdir -p deployed
           {
-            echo "NETWORK=$NETWORK"
-            echo "RPC_URL=$RPC_URL"
-            echo "NETWORK_PASSPHRASE=$NETWORK_PASSPHRASE"
-            echo "ACCESS_LEASE_ID=$ACCESS_LEASE_ID"
-            echo "SUBSCRIPTION_ID=$SUBSCRIPTION_ID"
-            echo "THIRD_ID=$THIRD_ID"
-          } > deployed/contract-ids.env
-          cat deployed/contract-ids.env
+            echo "vault_registry=$VAULT_REGISTRY"
+            echo "vault_registry_version=$(VERSION_OF vault-registry)"
+            echo "access_lease=$ACCESS_LEASE"
+            echo "access_lease_version=$(VERSION_OF access-lease)"
+            echo "subscription=$SUBSCRIPTION"
+            echo "subscription_version=$(VERSION_OF subscription)"
+            echo "network=$NETWORK"
+            echo "deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > deployed/mainnet-contract-ids.env
+          cat deployed/mainnet-contract-ids.env
 
       - name: Commit contract IDs
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add deployed/contract-ids.env
+          git add deployed/mainnet-contract-ids.env
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
             git commit -m "chore: update mainnet contract IDs [skip ci]"
             git push
           fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

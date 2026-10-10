@@ -3,8 +3,8 @@
   <p><strong>Soroban smart contracts on the Stellar network</strong></p>
   <p>
     <a href="https://github.com/SynapsVault/contracts/actions"><img src="https://github.com/SynapsVault/contracts/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-    <img src="https://img.shields.io/badge/Soroban-v21-7D00FF" alt="Soroban v21">
-    <img src="https://img.shields.io/badge/Rust-1.78%2B-orange" alt="Rust">
+    <img src="https://img.shields.io/badge/soroban--sdk-v22-7D00FF" alt="soroban-sdk v22">
+    <img src="https://img.shields.io/badge/Rust-1.84%2B-orange" alt="Rust">
     <img src="https://img.shields.io/badge/network-Stellar-blue" alt="Stellar">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT">
   </p>
@@ -20,6 +20,19 @@ The on-chain registry for SynapsVault resources. Stores creator address, price (
 
 Only the registered creator can mutate their resource (`require_auth`). Ownership can be transferred. Supports paginated listing and metadata updates.
 
+**Functions**
+
+| Function | Auth | Description |
+|---|---|---|
+| `init(admin)` | — (once) | Set upgrade admin |
+| `register(creator, id, price, metadata, tags)` | Creator | Register a resource |
+| `set_price` / `update_metadata` / `set_tags` | Creator | Mutate a resource |
+| `set_listed` / `delist` | Creator | Toggle discoverability |
+| `transfer_ownership(id, new_creator)` | Creator | Hand over ownership |
+| `get` / `get_owner` / `exists` / `count` | None | Reads |
+| `list(start, limit)` | None | Paginated, max 20 per page |
+| `upgrade(new_wasm_hash)` | Admin | Upgrade WASM |
+
 See [`docs/CONTRACTS.md`](docs/CONTRACTS.md#vault-registry) for the full interface reference.
 
 ### `access-lease` ⭐
@@ -30,7 +43,8 @@ Time-limited on-chain access grants. The backend issues a `Lease` struct with a 
 
 | Function | Auth | Description |
 |---|---|---|
-| `init(admin)` | — | Set admin at deploy |
+| `init(admin)` | — (once) | Set admin at deploy |
+| `set_admin(new_admin)` | Admin | Rotate admin |
 | `grant_lease(resource_id, buyer, duration_ledgers)` | Admin | Issue a timed lease |
 | `extend_lease(resource_id, buyer, extra_ledgers)` | Admin | Extend lease |
 | `is_valid(resource_id, buyer)` | None | Check active status |
@@ -47,12 +61,14 @@ Recurring 30-day subscription plans. Publishers define plans; the backend subscr
 
 | Function | Auth | Description |
 |---|---|---|
-| `init(admin)` | — | Set admin at deploy |
-| `create_plan(publisher, plan_id, price_per_cycle)` | Publisher | Define a plan |
+| `init(admin)` | — (once) | Set admin at deploy |
+| `set_admin(new_admin)` | Admin | Rotate admin |
+| `create_plan(publisher, plan_id, price_per_cycle)` | Publisher | Define a plan (ids are unique) |
+| `get_plan(plan_id)` | None | Read a plan |
 | `deactivate_plan(plan_id)` | Publisher | Close plan to new subs |
 | `subscribe(plan_id, subscriber)` | Admin | Start subscription |
 | `renew(plan_id, subscriber)` | Admin | Add one billing cycle |
-| `cancel(plan_id, subscriber)` | Subscriber | Self-cancel |
+| `cancel(plan_id, subscriber)` | Subscriber | Self-cancel (access runs to period end) |
 | `is_active(plan_id, subscriber)` | None | Check active status |
 | `get_subscription(plan_id, subscriber)` | None | Full sub struct |
 
@@ -71,175 +87,115 @@ Detailed contract documentation lives in [`docs/CONTRACTS.md`](docs/CONTRACTS.md
 ## Quick start
 
 ```bash
-# Prerequisites
+# Prerequisites: Rust 1.84+ (rust-toolchain.toml installs the wasm32v1-none target)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-rustup target add wasm32-unknown-unknown
-cargo install --locked soroban-cli
+# Stellar CLI — see https://developers.stellar.org/docs/tools/cli
+cargo install --locked stellar-cli
 
 # Clone
 git clone https://github.com/SynapsVault/contracts SynapsVault-contracts
 cd SynapsVault-contracts
 
-# Run tests
+# Run tests, lints and docs (same as CI)
 cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 
 # Build WASM
-cargo build --target wasm32-unknown-unknown --release --workspace
-# Output: target/wasm32-unknown-unknown/release/*.wasm
+cargo build --target wasm32v1-none --release --workspace
+# Output: target/wasm32v1-none/release/*.wasm
 ```
+
+> Soroban does not support the WASM features (reference-types, multi-value)
+> that Rust ≥ 1.82 enables by default on `wasm32-unknown-unknown`. Always build
+> for `wasm32v1-none` (or use `stellar contract build`, which does so).
 
 ## Deploy to Stellar testnet
 
 ```bash
-# Ensure Soroban CLI is configured for testnet
-soroban network add testnet \
+stellar network add testnet \
   --rpc-url https://soroban-testnet.stellar.org \
   --network-passphrase "Test SDF Network ; September 2015"
 
-# Fund your account
-soroban keys generate --global deployer
-soroban keys fund deployer --network testnet
+stellar keys generate --global deployer
+stellar keys fund deployer --network testnet
 
-# Deploy vault-registry
-soroban contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/vault_registry.wasm \
-  --source deployer \
-  --network testnet
-
-# Deploy access-lease
-soroban contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/access_lease.wasm \
-  --source deployer \
-  --network testnet
-
-# Deploy subscription
-soroban contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/subscription.wasm \
-  --source deployer \
-  --network testnet
+for PKG in vault_registry access_lease subscription; do
+  ID=$(stellar contract deploy \
+    --wasm target/wasm32v1-none/release/$PKG.wasm \
+    --source-account deployer --network testnet)
+  # init is one-time and cannot be repeated — run it right after deploy.
+  stellar contract invoke --id "$ID" --source-account deployer --network testnet \
+    -- init --admin <PLATFORM_ADMIN_ADDRESS>
+  echo "$PKG=$ID"
+done
 ```
 
 ## Deploy to Stellar mainnet
 
-Mainnet deploys follow the same flow as testnet with a different network
-configuration and a hardware-backed signing key. **Never** reuse the testnet
+Mainnet deploys use the **Mainnet Deploy** workflow (manual dispatch, requires
+typing `deploy-mainnet` and approval on the `mainnet` environment). It runs the
+test suite, builds, deploys and initialises all three contracts and commits the
+IDs to `deployed/mainnet-contract-ids.env`. **Never** reuse the testnet
 deployer key on mainnet.
-
-```bash
-# Configure mainnet
-soroban network add mainnet \
-  --rpc-url https://soroban-mainnet.stellar.org \
-  --network-passphrase "Public Global Stellar Network ; September 2015"
-
-# Use a dedicated, hardware-backed mainnet key
-soroban keys generate --global mainnet-deployer
-# Fund it with real XLM before proceeding.
-
-# Build a reproducible, optimized WASM artifact
-cargo build --target wasm32-unknown-unknown --release --workspace
-soroban contract optimize \
-  --wasm target/wasm32-unknown-unknown/release/vault_registry.wasm
-# ...repeat optimize for access_lease.wasm and subscription.wasm
-
-# Deploy each contract (record the returned contract IDs)
-soroban contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/vault_registry.wasm \
-  --source mainnet-deployer \
-  --network mainnet
-
-# Initialize each contract with the platform admin wallet
-soroban contract invoke \
-  --id <C_REGISTRY_ID> \
-  --source mainnet-deployer \
-  --network mainnet \
-  -- init --admin <PLATFORM_ADMIN_ADDRESS>
-```
 
 **Mainnet checklist**
 
 1. All tests green on `main` and the release tag is signed.
-2. WASM artifacts are optimized and their hashes recorded (see *Upgrades*).
+2. WASM hashes are recorded (see *Upgrades*).
 3. Contract IDs and admin address are written to the backend's mainnet config.
-4. `init` is called exactly once per contract — it is not idempotent.
+4. `init` is called exactly once per contract — a second call fails with `AlreadyInitialised`.
 5. A post-deploy smoke test verifies `is_valid` / `is_active` reads.
 
 ## Upgrades
 
-Contracts are upgradeable through an **admin-gated upgrade entrypoint**. The
-admin uploads a new WASM blob to the ledger, then points the existing contract
-at that blob's hash. Storage layout is preserved across upgrades, so existing
-leases, plans, and subscriptions remain readable.
-
-**Flow**
+Contracts are upgradeable through an **admin-gated `upgrade` entrypoint**. The
+admin uploads a new WASM blob, then points the existing contract at that blob's
+hash. Storage is preserved, so existing resources, leases, plans and
+subscriptions remain readable.
 
 ```bash
-# 1. Build and optimize the new WASM
-cargo build --target wasm32-unknown-unknown --release --workspace
-soroban contract optimize \
-  --wasm target/wasm32-unknown-unknown/release/access_lease.wasm
+# 1. Build
+cargo build --target wasm32v1-none --release --workspace
 
 # 2. Upload the WASM blob and capture its hash
-soroban contract upload \
-  --wasm target/wasm32-unknown-unknown/release/access_lease.wasm \
-  --source mainnet-deployer \
-  --network mainnet
-# -> returns the wasm hash, e.g. 0xabc123...
+HASH=$(stellar contract upload \
+  --wasm target/wasm32v1-none/release/access_lease.wasm \
+  --source-account mainnet-deployer --network mainnet)
 
 # 3. Point the live contract at the new hash (admin auth required)
-soroban contract invoke \
-  --id <C_LEASE_ID> \
-  --source mainnet-deployer \
-  --network mainnet \
-  -- upgrade --new_wasm_hash 0xabc123...
+stellar contract invoke --id <C_LEASE_ID> \
+  --source-account <ADMIN> --network mainnet \
+  -- upgrade --new_wasm_hash "$HASH"
 ```
-
-The `upgrade` entrypoint calls `require_auth()` on the stored admin address, so
-only the platform admin wallet can change a contract's code. Uploading a WASM
-blob is permissionless, but it has no effect until the admin invokes `upgrade`.
 
 **Migration notes**
 
-- The upgrade entrypoint does **not** run data migrations. Any change to a
-  stored struct's layout must be handled by a follow-up admin call that reads
-  and rewrites entries in the new shape.
-- Additive changes (new fields appended to a struct) are safe only if the
-  contract tolerates missing fields on read; prefer a versioned key or an
-  explicit migration entrypoint for anything else.
+- `upgrade` does **not** run data migrations. A change to a stored struct's
+  layout needs a follow-up admin migration.
 - Always upgrade on testnet first, verify reads against existing data, then
   repeat the exact same hash on mainnet.
-- Keep the previous WASM hash recorded so a rollback is a single `upgrade`
-  call.
-
-## Gas optimization
-
-Contract entrypoints are written to minimize ledger footprint and CPU
-instructions, since both drive Soroban fees:
-
-- **Batched storage reads.** `is_valid` / `is_active` fetch the lease or
-  subscription in a single `get`, avoiding repeated instance lookups.
-- **Packed structs.** Fields are ordered to avoid padding and use the smallest
-  integer types that fit (`u32` ledger sequences, `i128` amounts only where
-  required).
-- **No unbounded loops.** Paginated listing caps page size so a single call
-  cannot exceed the instruction budget.
-- **TTL bumps on write only.** Entries are bumped once per mutation rather than
-  on every read, keeping read paths cheap.
-- **Optimized WASM.** Release builds run through `soroban contract optimize`
-  before deploy, shrinking the blob and its upload cost.
-=======
+- Keep the previous WASM hash recorded so a rollback is a single `upgrade` call.
 
 ## CI/CD
 
 ```
-Push to feat/* ──► Cargo test + fmt + clippy
-                         │
-Merge to dev   ──► Tests + WASM build
-                         │
-Merge to main  ──► Tests + WASM build + deploy to Stellar testnet
+PR / push to dev, main ──► fmt + clippy (-D warnings) + rustdoc (-D warnings)
+                           tests (all contracts) + gas report
+                           WASM build (wasm32v1-none) + 64 KiB size check
+Merge to main          ──► build + deploy + init on Stellar testnet
+Manual dispatch        ──► mainnet deploy (confirmation + environment approval)
 ```
 
-GitHub secrets required for auto-deploy:
-- `STELLAR_TESTNET_SECRET_KEY` — Stellar keypair with testnet XLM
+GitHub secrets:
+
+| Secret | Used by |
+|---|---|
+| `DEPLOYER_SECRET` | Testnet deploy (deploy is skipped if unset) |
+| `BACKEND_PUBLIC` | Testnet admin address passed to `init` |
+| `PUBLISHER1_PUBLIC`, `PUBLISHER2_PUBLIC` | Funded via friendbot on testnet |
+| `MAINNET_DEPLOYER_SECRET` | Mainnet deploy (`mainnet` environment) |
+| `MAINNET_ADMIN_PUBLIC` | Mainnet admin address passed to `init` |
 
 ## Architecture
 
@@ -250,40 +206,36 @@ Stellar Ledger
 │   └── Resource { id, creator, price, metadata, tags, listed }
 │
 ├── access-lease       (C_LEASE_ID)
-│   └── Lease { resource_id, buyer, granted_at, expires_at }
+│   └── Lease { resource_id, buyer, granted_at, expires_at, duration_ledgers }
 │
 └── subscription       (C_SUB_ID)
     ├── Plan { plan_id, publisher, price_per_cycle, active }
-    └── Subscription { plan_id, subscriber, period_end, renewals }
+    └── Subscription { plan_id, subscriber, started_at, current_period_end, cancelled, total_renewals }
 ```
 
 ## Storage TTLs
 
-All persistent entries are bumped **90 days** on every write — actively managed resources are never archived by the ledger's state expiry mechanism.
+Entries are TTL-bumped on every write so actively managed data is never
+archived:
+
+| Contract | Persistent bump |
+|---|---|
+| `vault-registry` | 30 days |
+| `access-lease` | 90 days |
+| `subscription` | 365 days |
 
 ## Security
 
 - Every mutating call is gated by `require_auth()` on the appropriate authority.
+- `init` is one-time on every contract; the admin can only be changed by the
+  current admin via `set_admin`.
 - The `admin` role is held by the backend's platform wallet — **not** a user wallet.
-- `is_valid` and `is_active` are fully permissionless — any frontend or smart contract can verify access without relying on SynapsVault's API.
-- Contract upgrades are admin-gated: uploading a WASM blob is permissionless,
-  but only the admin can invoke `upgrade` to change live code.
+- `is_valid` and `is_active` are fully permissionless — any frontend or smart
+  contract can verify access without relying on SynapsVault's API.
+- All ledger-sequence arithmetic is checked; overflow returns an error instead of wrapping.
+- Every state change emits an event for off-chain indexing and auditing.
 
-### `access-lease` audit findings
-
-An internal security review of `access-lease` covered lease issuance, expiry,
-and revocation. Findings and their resolutions:
-
-| ID | Severity | Finding | Resolution |
-|---|---|---|---|
-| AL-1 | High | `grant_lease` accepted `duration_ledgers = 0`, minting a lease that was never valid yet consumed storage. | Reject zero/negative durations; `grant_lease` now requires `duration_ledgers > 0`. |
-| AL-2 | Medium | `extend_lease` on an expired lease silently restarted access from the current ledger, letting a lapsed buyer regain access without a new grant. | `extend_lease` now extends from `max(expires_at, current_ledger)` and requires an active lease. |
-| AL-3 | Medium | `revoke_lease` left the lease entry in place, so a later `grant_lease` for the same `(resource_id, buyer)` could be shadowed by stale data. | `revoke_lease` removes the entry and bumps TTL on the tombstone-free path. |
-| AL-4 | Low | `is_valid` compared `expires_at` with `<=`, treating a lease as invalid on its final ledger. | Boundary changed to `<` so the final ledger is inclusive. |
-| AL-5 | Low | Admin rotation was impossible; a compromised admin key required redeploying the contract. | Added an admin-only `set_admin` entrypoint. |
-
-All findings are resolved in the current release. No open High or Medium issues
-remain as of this revision.
+See [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) for findings and their status.
 
 ## Repo siblings
 
@@ -295,4 +247,3 @@ remain as of this revision.
 ## License
 
 MIT © 2025 Busiii-adetiba
-# SynapsVault Contracts — deployed on Stellar testnet

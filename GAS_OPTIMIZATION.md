@@ -1,169 +1,82 @@
-# Gas Optimization Notes — Vault Registry
+# Gas Optimization Notes
 
-This document describes the methodology used to profile and optimize the `vault-registry`
-contract, the concrete changes that were made, and the before/after measurements that
-justify them.
+Soroban fees are driven by CPU instructions, memory, ledger entries
+read/written, and WASM size. This document describes how the contracts keep
+those low and how to measure them.
 
-## Scope
+## Design choices
 
-The `vault-registry` contract is responsible for:
+**Storage**
 
-- Registering vaults and their metadata.
-- Tracking per-vault accounting (assets, shares, limits).
-- Exposing read paths used by integrators and the router.
+- **One entry per record.** A `Resource`, `Lease`, `Plan` or `Subscription` is a
+  single `#[contracttype]` struct under one key, so each hot-path call touches
+  exactly one persistent entry (plus the instance entry for admin calls).
+- **Instance storage for contract-wide values.** `Admin`, `Version` and the
+  registry `Count` live in instance storage, which is loaded once per invocation.
+- **Single read for access checks.** `is_valid` / `is_active` do one `get` and
+  a comparison — no auth, no writes, no TTL bumps.
+- **Validation before storage access.** Price / tag / duration checks run
+  before any ledger reads, so invalid calls fail cheaply.
+- **No-op cancel.** Cancelling an already-cancelled subscription returns
+  without writing.
 
-Because it is on the hot path for every deposit/withdraw routed through the protocol,
-CPU instructions, memory footprint, and ledger entry reads/writes all matter.
+**TTL**
 
-## Profiling Methodology
+- **Bump on write only.** Read paths never extend TTLs.
+- **Threshold-based bumping.** `extend_ttl(threshold, amount)` is a no-op
+  unless the remaining TTL is below `amount - 1 day`, so repeated writes in the
+  same day pay no extension cost.
 
-All measurements are produced with `soroban-cli` against a deterministic test harness
-so that runs are comparable across commits.
+**Bounded work**
 
-### 1. Build with the release profile
+- `vault-registry::list` caps page size at `MAX_PAGE_SIZE` (20), so one call
+  can never exceed the per-transaction budget regardless of registry size.
+- Tags are bounded (`MAX_TAGS` = 8, `MAX_TAG_LEN` = 32) and metadata pointers
+  are bounded (`MAX_METADATA_POINTER_LEN` = 512 bytes), which bounds entry size.
 
-```bash
-cargo build --target wasm32-unknown-unknown --release -p vault-registry
-```
+**WASM size**
 
-The release profile enables `opt-level = "z"`, LTO, and `panic = "abort"` (see the
-workspace `Cargo.toml`). Debug builds are never used for measurements.
+The release profile (workspace `Cargo.toml`) uses `opt-level = "z"`, LTO,
+`codegen-units = 1`, `panic = "abort"` and stripped symbols. CI fails the build
+if any contract exceeds Soroban's 64 KiB limit and reports sizes in the job
+summary.
 
-### 2. Capture cost and footprint
+| Contract | Release WASM (wasm32v1-none) |
+|---|---|
+| `vault-registry` | ~26 KB |
+| `subscription` | ~22 KB |
+| `access-lease` | ~16 KB |
 
-```bash
-soroban contract invoke \
-  --id <CONTRACT_ID> \
-  --wasm target/wasm32-unknown-unknown/release/vault_registry.wasm \
-  --fn <entrypoint> \
-  -- <args> \
-  --cost
-```
+## Measuring
 
-The `--cost` flag prints:
-
-- `cpu_insns` — total CPU instructions consumed.
-- `mem_bytes` — peak memory footprint.
-- `ledger_read_bytes` / `ledger_write_bytes` — bytes read from and written to the
-  ledger.
-- `read_entries` / `write_entries` — number of ledger entries touched.
-
-We record all of these for each entrypoint under test.
-
-### 3. Footprint inspection
-
-For a finer-grained view of which storage keys dominate cost, run with the
-`--footprint` flag (or inspect the `Footprint` returned by the host):
+The `gas_register_and_list_budget` test in `vault-registry` prints the CPU and
+memory cost of the hot entrypoints and asserts upper bounds, so large
+regressions fail CI:
 
 ```bash
-soroban contract invoke ... --footprint
+cargo test -p vault-registry gas -- --nocapture
 ```
 
-This lists every `LedgerKey` read or written, which is the primary signal for the
-storage optimizations below.
+Current numbers (host test environment, native execution — on-chain WASM
+execution costs more, but relative changes track):
 
-### 4. Regression harness
+| Entrypoint | CPU instructions | Memory bytes |
+|---|---|---|
+| `register` (2 tags) | ~77,000 | ~12,200 |
+| `set_price` | ~65,000 | ~9,900 |
+| `get` | ~30,000 | ~3,700 |
+| `list(0, 20)` | ~687,000 | ~75,800 |
 
-A small script (`scripts/gas_report.sh`) runs the same set of invocations and emits a
-table of `cpu_insns`, `mem_bytes`, `read_entries`, and `write_entries`. CI compares the
-output against a checked-in baseline and fails on regressions above a configurable
-threshold (default 5%).
-
-## Optimizations
-
-### Storage read/write reductions
-
-1. **Pack related fields into a single struct.**
-   Previously, vault metadata and accounting were stored under separate keys
-   (`VaultMeta(vault_id)` and `VaultState(vault_id)`), forcing two ledger reads on
-   every operation. They are now stored together in a single `VaultRecord` under one
-   key, halving the read count on the hot path.
-
-2. **Cache repeated reads within a call.**
-   Entrypoints that read the same key more than once now load it once into a local
-   variable and reuse it. This removes redundant host round-trips for the same
-   `LedgerKey`.
-
-3. **Avoid writes when nothing changed.**
-   Update paths compare the new value against the loaded value and skip the
-   `storage.set` when they are equal. This eliminates no-op writes (and their
-   associated TTL bumps) for idempotent calls.
-
-4. **Use `Instance` storage for contract-wide config.**
-   Parameters that are read on nearly every call (e.g. fee bps, admin) live in
-   `Instance` storage rather than `Persistent`, so they are loaded once per
-   invocation instead of being fetched as separate persistent entries.
-
-5. **Shrink serialized values.**
-   Numeric fields use the smallest sufficient integer type, and optional fields are
-   omitted rather than stored as `None`, reducing `ledger_write_bytes`.
-
-### TTL bump minimization
-
-1. **Bump only on mutation.**
-   TTL extensions are performed only when an entry is actually written. Read-only
-   paths no longer bump TTLs, which previously caused unnecessary ledger writes.
-
-2. **Single bump per entry per call.**
-   When multiple fields of the same record are updated, the record is written once at
-   the end of the call, so the TTL is extended exactly once.
-
-3. **Threshold-based bumping.**
-   Instead of bumping on every write, the contract checks the remaining TTL and only
-   extends when it falls below a threshold (`BUMP_THRESHOLD`), extending to
-   `BUMP_AMOUNT`. This keeps entries alive without paying the bump cost on every
-   invocation.
-
-4. **Longer TTLs for cold data.**
-   Rarely-touched registry entries use a larger `BUMP_AMOUNT` so they are extended
-   less frequently.
-
-## Before / After Measurements
-
-Measurements below are from the release WASM, single-invocation runs, averaged over
-10 runs on the same host. Values are illustrative of the improvements achieved; exact
-numbers will vary by host and SDK version.
-
-| Entrypoint        | Metric          | Before    | After     | Δ        |
-|-------------------|-----------------|-----------|-----------|----------|
-| `register_vault`  | `cpu_insns`     | 1,420,000 | 1,010,000 | −28.9%   |
-| `register_vault`  | `mem_bytes`     | 42,000    | 33,500    | −20.2%   |
-| `register_vault`  | `write_entries` | 3         | 2         | −33.3%   |
-| `update_vault`    | `cpu_insns`     | 980,000   | 640,000   | −34.7%   |
-| `update_vault`    | `read_entries`  | 3         | 1         | −66.7%   |
-| `update_vault`    | `write_entries` | 2         | 1         | −50.0%   |
-| `get_vault`       | `cpu_insns`     | 410,000   | 300,000   | −26.8%   |
-| `get_vault`       | `read_entries`  | 2         | 1         | −50.0%   |
-| `get_vault`       | `write_entries` | 1         | 0         | −100.0%  |
-| `list_vaults`     | `cpu_insns`     | 2,150,000 | 1,780,000 | −17.2%   |
-| `list_vaults`     | `mem_bytes`     | 88,000    | 71,000    | −19.3%   |
-
-### Notes on the numbers
-
-- The largest wins come from collapsing two ledger reads into one and from removing
-  no-op writes on read-only paths.
-- `list_vaults` improves less because it is dominated by iteration over many entries;
-  the per-entry savings still accumulate.
-- CPU instruction counts scale roughly linearly with the number of ledger entries
-  touched, so `read_entries`/`write_entries` are the most useful leading indicators.
-
-## Reproducing
+To measure real on-chain cost, simulate against testnet:
 
 ```bash
-# Build
-cargo build --target wasm32-unknown-unknown --release -p vault-registry
-
-# Run the harness
-./scripts/gas_report.sh
-
-# Compare against baseline
-./scripts/gas_report.sh --check-baseline
+stellar contract invoke --id <CONTRACT_ID> --source-account <KEY> \
+  --network testnet --send=no -- get --id <RESOURCE_ID>
 ```
 
-## Guidelines for Future Changes
+## Guidelines for future changes
 
-- Always measure with `--cost` before and after a change; do not rely on intuition.
+- Measure before and after; update the table above when an intentional change lands.
 - Prefer fewer, larger ledger entries over many small ones.
-- Never bump TTLs on read-only paths.
-- Keep the baseline file up to date when an intentional improvement lands.
-- Add a regression test for any new hot-path entrypoint.
+- Never bump TTLs or write on read-only paths.
+- Keep every loop bounded by a constant.
