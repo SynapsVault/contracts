@@ -1,0 +1,34 @@
+name: Bug report
+description: Something in a contract, workflow or doc is wrong
+labels: [bug]
+body:
+  - type: dropdown
+    id: contract
+    attributes:
+      label: Component
+      options: [vault-registry, access-lease, subscription, CI / workflows, docs]
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Include the entrypoint, arguments and the error code or wrong result.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: A failing unit test is ideal. Otherwise list the exact steps / CLI invocations.
+      render: rust
+  - type: input
+    id: commit
+    attributes:
+      label: Commit or contract ID
