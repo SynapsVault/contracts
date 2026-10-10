@@ -44,7 +44,7 @@ jobs:
       PUBLISHER2_PUBLIC: ${{ secrets.PUBLISHER2_PUBLIC }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust + wasm32v1-none
         uses: dtolnay/rust-toolchain@stable
