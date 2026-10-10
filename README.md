@@ -3,8 +3,8 @@
   <p><strong>Soroban smart contracts on the Stellar network</strong></p>
   <p>
     <a href="https://github.com/SynapsVault/contracts/actions"><img src="https://github.com/SynapsVault/contracts/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-    <img src="https://img.shields.io/badge/soroban--sdk-v22-7D00FF" alt="soroban-sdk v22">
-    <img src="https://img.shields.io/badge/Rust-1.84%2B-orange" alt="Rust">
+    <img src="https://img.shields.io/badge/soroban--sdk-v28-7D00FF" alt="soroban-sdk v28">
+    <img src="https://img.shields.io/badge/Rust-1.91%2B-orange" alt="Rust">
     <img src="https://img.shields.io/badge/network-Stellar-blue" alt="Stellar">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT">
   </p>
@@ -87,9 +87,9 @@ Detailed contract documentation lives in [`docs/CONTRACTS.md`](docs/CONTRACTS.md
 ## Quick start
 
 ```bash
-# Prerequisites: Rust 1.84+ (rust-toolchain.toml installs the wasm32v1-none target)
+# Prerequisites: Rust 1.91+ (rust-toolchain.toml installs the wasm32v1-none target)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-# Stellar CLI — see https://developers.stellar.org/docs/tools/cli
+# Stellar CLI v25.2+ (required to build contracts) — see https://developers.stellar.org/docs/tools/cli
 cargo install --locked stellar-cli
 
 # Clone
@@ -102,13 +102,13 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 
 # Build WASM
-cargo build --target wasm32v1-none --release --workspace
+stellar contract build
 # Output: target/wasm32v1-none/release/*.wasm
 ```
 
-> Soroban does not support the WASM features (reference-types, multi-value)
-> that Rust ≥ 1.82 enables by default on `wasm32-unknown-unknown`. Always build
-> for `wasm32v1-none` (or use `stellar contract build`, which does so).
+> soroban-sdk 28 only builds contract WASM through `stellar contract build`
+> (stellar-cli v25.2+), which targets `wasm32v1-none` and strips unused
+> contract-spec entries. Plain `cargo build --target ...` fails on purpose.
 
 ## Deploy to Stellar testnet
 
@@ -156,7 +156,7 @@ subscriptions remain readable.
 
 ```bash
 # 1. Build
-cargo build --target wasm32v1-none --release --workspace
+stellar contract build
 
 # 2. Upload the WASM blob and capture its hash
 HASH=$(stellar contract upload \
@@ -182,7 +182,7 @@ stellar contract invoke --id <C_LEASE_ID> \
 ```
 PR / push to dev, main ──► fmt + clippy (-D warnings) + rustdoc (-D warnings)
                            tests (all contracts) + gas report
-                           WASM build (wasm32v1-none) + 64 KiB size check
+                           WASM build (stellar contract build) + 64 KiB size check
 Merge to main          ──► build + deploy + init on Stellar testnet
 Manual dispatch        ──► mainnet deploy (confirmation + environment approval)
 ```

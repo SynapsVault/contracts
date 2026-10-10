@@ -6,7 +6,8 @@
 //! trusting the SynapsVault backend — the Stellar ledger is the source of truth.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN,
+    ContractExecutable, Env, String,
 };
 
 const DAY: u32 = 17_280; // ~5s/ledger × 17280 = 1 day
@@ -71,6 +72,62 @@ pub enum Error {
     AlreadyInitialised = 7,
 }
 
+/// Emitted by [`AccessLease::init`]. Topics: `("init",)`; data: admin.
+#[contractevent(topics = ["init"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitEvent {
+    pub admin: Address,
+}
+
+/// Emitted by [`AccessLease::set_admin`]. Topics: `("setadmin",)`; data: new admin.
+#[contractevent(topics = ["setadmin"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetAdminEvent {
+    pub new_admin: Address,
+}
+
+/// Emitted by [`AccessLease::grant_lease`]. Topics: `("grant", resource_id, buyer)`;
+/// data: `expires_at`.
+#[contractevent(topics = ["grant"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantEvent {
+    #[topic]
+    pub resource_id: String,
+    #[topic]
+    pub buyer: Address,
+    pub expires_at: u32,
+}
+
+/// Emitted by [`AccessLease::extend_lease`]. Topics: `("extend", resource_id, buyer)`;
+/// data: new `expires_at`.
+#[contractevent(topics = ["extend"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtendEvent {
+    #[topic]
+    pub resource_id: String,
+    #[topic]
+    pub buyer: Address,
+    pub expires_at: u32,
+}
+
+/// Emitted by [`AccessLease::revoke_lease`]. Topics: `("revoke", resource_id, buyer)`;
+/// no data.
+#[contractevent(topics = ["revoke"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevokeEvent {
+    #[topic]
+    pub resource_id: String,
+    #[topic]
+    pub buyer: Address,
+}
+
+/// Emitted by [`AccessLease::upgrade`]. Topics: `("upgrade",)`; data: new WASM hash.
+#[contractevent(topics = ["upgrade"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeEvent {
+    pub new_wasm_hash: BytesN<32>,
+}
+
 #[contract]
 pub struct AccessLease;
 
@@ -99,7 +156,7 @@ impl AccessLease {
             .instance()
             .set(&DataKey::Version, &String::from_str(&env, VERSION));
         env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
-        env.events().publish((symbol_short!("init"),), admin);
+        InitEvent { admin }.publish(&env);
         Ok(())
     }
 
@@ -122,8 +179,7 @@ impl AccessLease {
         Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
-        env.events()
-            .publish((symbol_short!("setadmin"),), new_admin);
+        SetAdminEvent { new_admin }.publish(&env);
         Ok(())
     }
 
@@ -202,8 +258,12 @@ impl AccessLease {
         env.storage()
             .persistent()
             .extend_ttl(&key, BUMP_THRESH, BUMP);
-        env.events()
-            .publish((symbol_short!("grant"), resource_id, buyer), expires_at);
+        GrantEvent {
+            resource_id,
+            buyer,
+            expires_at,
+        }
+        .publish(&env);
         Ok(lease)
     }
 
@@ -250,10 +310,12 @@ impl AccessLease {
         env.storage()
             .persistent()
             .extend_ttl(&key, BUMP_THRESH, BUMP);
-        env.events().publish(
-            (symbol_short!("extend"), resource_id, buyer),
-            lease.expires_at,
-        );
+        ExtendEvent {
+            resource_id,
+            buyer,
+            expires_at: lease.expires_at,
+        }
+        .publish(&env);
         Ok(lease)
     }
 
@@ -299,8 +361,7 @@ impl AccessLease {
             return Err(Error::LeaseNotFound);
         }
         env.storage().persistent().remove(&key);
-        env.events()
-            .publish((symbol_short!("revoke"), resource_id, buyer), ());
+        RevokeEvent { resource_id, buyer }.publish(&env);
         Ok(())
     }
 
@@ -308,9 +369,8 @@ impl AccessLease {
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         Self::require_admin(&env)?;
         env.deployer()
-            .update_current_contract_wasm(new_wasm_hash.clone());
-        env.events()
-            .publish((symbol_short!("upgrade"),), new_wasm_hash);
+            .update_current_contract(ContractExecutable::Wasm(new_wasm_hash.clone()));
+        UpgradeEvent { new_wasm_hash }.publish(&env);
         Ok(())
     }
 }
@@ -336,8 +396,9 @@ impl AccessLease {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke},
-        Address, Env, IntoVal, String,
+        symbol_short,
+        testutils::{Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke},
+        vec, Address, Env, IntoVal, String,
     };
 
     fn setup<'a>() -> (Env, AccessLeaseClient<'a>, Address) {
@@ -560,6 +621,41 @@ mod tests {
         client.set_admin(&new_admin);
         assert_eq!(env.auths()[0].0, admin);
         assert_eq!(client.admin(), new_admin);
+    }
+
+    /// Event topics/data must stay wire-compatible with what indexers expect
+    /// (see docs/CONTRACTS.md).
+    #[test]
+    fn events_have_documented_shape() {
+        let (env, client, _admin) = setup();
+        let buyer = Address::generate(&env);
+        let rid = String::from_str(&env, "r");
+
+        let lease = client.grant_lease(&rid, &buyer, &10u32);
+        assert_eq!(
+            env.events().all().filter_by_contract(&client.address),
+            vec![
+                &env,
+                (
+                    client.address.clone(),
+                    (symbol_short!("grant"), rid.clone(), buyer.clone()).into_val(&env),
+                    lease.expires_at.into_val(&env),
+                ),
+            ]
+        );
+
+        client.revoke_lease(&rid, &buyer);
+        assert_eq!(
+            env.events().all().filter_by_contract(&client.address),
+            vec![
+                &env,
+                (
+                    client.address.clone(),
+                    (symbol_short!("revoke"), rid.clone(), buyer.clone()).into_val(&env),
+                    ().into_val(&env),
+                ),
+            ]
+        );
     }
 
     #[test]

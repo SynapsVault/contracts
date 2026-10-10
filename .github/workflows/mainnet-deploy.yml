@@ -60,7 +60,7 @@ jobs:
         run: |
           curl -sL \
             https://github.com/stellar/stellar-cli/releases/download/v27.0.0/stellar-cli-27.0.0-x86_64-unknown-linux-gnu.tar.gz \
-            | tar xz -C /usr/local/bin
+            | sudo tar xz -C /usr/local/bin
           stellar --version
 
       - name: Test contracts
@@ -68,7 +68,7 @@ jobs:
 
       - name: Build contracts
         run: |
-          cargo build --locked --target wasm32v1-none --release --workspace
+          stellar contract build --locked
           ls -lh target/wasm32v1-none/release/*.wasm
 
       - name: Configure network

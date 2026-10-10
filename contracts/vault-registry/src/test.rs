@@ -5,7 +5,8 @@ extern crate std;
 use super::*;
 use proptest::prelude::*;
 use soroban_sdk::{
-    testutils::{storage::Persistent as _, Address as _, Ledger as _},
+    symbol_short,
+    testutils::{storage::Persistent as _, Address as _, Events as _, Ledger as _},
     Address, Env, String, Vec,
 };
 
@@ -952,6 +953,45 @@ fn gas_register_and_list_budget() {
     // Network limit is 100M instructions per tx; stay well below it.
     assert!(reg_cpu < 10_000_000, "register too expensive: {reg_cpu}");
     assert!(list_cpu < 50_000_000, "list too expensive: {list_cpu}");
+}
+
+/// Event topics/data must stay wire-compatible with what indexers expect
+/// (see docs/CONTRACTS.md).
+#[test]
+fn events_have_documented_shape() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "ev");
+    client.register(
+        &creator,
+        &id,
+        &100i128,
+        &String::from_str(&env, "m"),
+        &empty_tags(&env),
+    );
+    assert_eq!(
+        env.events().all().filter_by_contract(&client.address),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("register"), creator.clone()).into_val(&env),
+                id.clone().into_val(&env),
+            ),
+        ]
+    );
+
+    client.set_price(&id, &250i128);
+    assert_eq!(
+        env.events().all().filter_by_contract(&client.address),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("setprice"), id.clone()).into_val(&env),
+                250i128.into_val(&env),
+            ),
+        ]
+    );
 }
 
 proptest! {
