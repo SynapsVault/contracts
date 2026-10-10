@@ -1,0 +1,31 @@
+name: Feature / task
+description: Propose new functionality or a maintenance task
+labels: [enhancement]
+body:
+  - type: dropdown
+    id: contract
+    attributes:
+      label: Component
+      options: [vault-registry, access-lease, subscription, CI / workflows, docs, tooling]
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: New entrypoints, storage keys, events and error codes, if any.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      placeholder: "- [ ] ...\n- [ ] Tests cover success and unauthorised/error paths\n- [ ] docs/CONTRACTS.md updated"
+    validations:
+      required: true

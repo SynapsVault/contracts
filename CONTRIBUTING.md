@@ -1,5 +1,15 @@
 # Contributing to SynapsVault Contracts
 
+Thanks for contributing! Please read the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Picking up an issue
+
+- Comment on the issue (or apply through Drips Wave) and wait to be assigned before starting.
+- Issues labelled `complexity: trivial`, `complexity: medium` or `complexity: high`
+  describe the expected scope; each lists acceptance criteria.
+- One issue per PR. Reference it with `Closes #<n>`.
+- Report security vulnerabilities privately — see [SECURITY.md](SECURITY.md).
+
 ## Prerequisites
 
 ```bash
