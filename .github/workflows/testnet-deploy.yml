@@ -46,19 +46,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust + wasm32
+      - name: Install Rust + wasm32v1-none
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          targets: wasm32v1-none
 
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - uses: Swatinem/rust-cache@v2
 
       - name: Install Stellar CLI v27
         run: |
@@ -75,7 +68,9 @@ jobs:
 
       - name: Fund accounts
         run: |
-          DEPLOYER_PUB="GCJH6RF7EU7LRXZK3QPJD2XZ7ZL7GI67WUPVRWROJ6XDEJKHIKW7GFWX"
+          stellar keys add deployer --secret-key <<< "$DEPLOYER_SECRET" >/dev/null 2>&1 || true
+          DEPLOYER_PUB=$(stellar keys address deployer 2>/dev/null \
+            || echo "GCJH6RF7EU7LRXZK3QPJD2XZ7ZL7GI67WUPVRWROJ6XDEJKHIKW7GFWX")
           for ADDR in "$DEPLOYER_PUB" "$BACKEND_PUBLIC" "$PUBLISHER1_PUBLIC" "$PUBLISHER2_PUBLIC"; do
             echo "Funding $ADDR"
             curl -sf "https://friendbot.stellar.org?addr=${ADDR}" > /dev/null && echo "  ✅" || echo "  ⚠️"
@@ -83,16 +78,16 @@ jobs:
 
       - name: Build all contracts
         run: |
-          cargo build --target wasm32-unknown-unknown --release \
+          cargo build --locked --target wasm32v1-none --release \
             --package vault-registry \
             --package access-lease \
             --package subscription
-          ls -lh target/wasm32-unknown-unknown/release/*.wasm
+          ls -lh target/wasm32v1-none/release/*.wasm
 
       - name: Deploy vault-registry
         run: |
           ID=$(stellar contract deploy \
-            --wasm target/wasm32-unknown-unknown/release/vault_registry.wasm \
+            --wasm target/wasm32v1-none/release/vault_registry.wasm \
             --source-account "$DEPLOYER_SECRET" \
             --network testnet --ignore-checks)
           echo "VAULT_REGISTRY=$ID" >> $GITHUB_ENV
@@ -101,7 +96,7 @@ jobs:
       - name: Deploy access-lease
         run: |
           ID=$(stellar contract deploy \
-            --wasm target/wasm32-unknown-unknown/release/access_lease.wasm \
+            --wasm target/wasm32v1-none/release/access_lease.wasm \
             --source-account "$DEPLOYER_SECRET" \
             --network testnet --ignore-checks)
           echo "ACCESS_LEASE=$ID" >> $GITHUB_ENV
@@ -110,11 +105,19 @@ jobs:
       - name: Deploy subscription
         run: |
           ID=$(stellar contract deploy \
-            --wasm target/wasm32-unknown-unknown/release/subscription.wasm \
+            --wasm target/wasm32v1-none/release/subscription.wasm \
             --source-account "$DEPLOYER_SECRET" \
             --network testnet --ignore-checks)
           echo "SUBSCRIPTION=$ID" >> $GITHUB_ENV
           echo "::notice::subscription=$ID"
+
+      - name: Init vault-registry
+        run: |
+          stellar contract invoke \
+            --id "$VAULT_REGISTRY" \
+            --source-account "$DEPLOYER_SECRET" \
+            --network testnet \
+            -- init --admin "$BACKEND_PUBLIC"
 
       - name: Init access-lease
         run: |

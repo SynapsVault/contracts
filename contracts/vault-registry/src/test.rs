@@ -1,5 +1,7 @@
 #![cfg(test)]
 
+extern crate std;
+
 use super::*;
 use proptest::prelude::*;
 use soroban_sdk::{
@@ -8,6 +10,14 @@ use soroban_sdk::{
 };
 
 const DAY_IN_LEDGERS: u32 = 17_280;
+
+/// Prebuilt registry WASM used as the target of upgrade tests. Regenerate with
+/// `make fixture` from `contracts/vault-registry` when the interface changes.
+const UPGRADE_TARGET_WASM: &[u8] = include_bytes!("../fixtures/vault_registry_upgrade_target.wasm");
+
+fn upload_upgrade_target(env: &Env) -> soroban_sdk::BytesN<32> {
+    env.deployer().upload_contract_wasm(UPGRADE_TARGET_WASM)
+}
 
 fn resource_storage_ttl(env: &Env, contract: &soroban_sdk::Address, id: &String) -> u32 {
     let key = DataKey::Resource(id.clone());
@@ -661,7 +671,7 @@ fn upgrade_requires_admin_auth() {
 
     client.init(&admin);
 
-    let wasm_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    let wasm_hash = upload_upgrade_target(&env);
     client.upgrade(&wasm_hash);
 
     // Admin auth must have been required for the upgrade call.
@@ -711,11 +721,23 @@ fn upgrade_with_valid_wasm_hash_succeeds() {
 
     client.init(&admin);
 
-    let wasm_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    let creator = Address::generate(&env);
+    let id = String::from_str(&env, "pre-upgrade");
+    client.register(
+        &creator,
+        &id,
+        &100i128,
+        &String::from_str(&env, "m"),
+        &empty_tags(&env),
+    );
+
+    let wasm_hash = upload_upgrade_target(&env);
     client.upgrade(&wasm_hash);
 
-    // Contract remains functional after upgrade.
-    assert_eq!(client.count(), 0);
+    // Contract remains functional and keeps its state after upgrade.
+    assert_eq!(client.count(), 1);
+    assert_eq!(client.get(&id).creator, creator);
+    assert_eq!(client.admin(), admin);
 }
 
 #[test]
@@ -765,7 +787,7 @@ fn footprint_regression_register_and_read() {
 #[test]
 fn version_returns_expected_string() {
     let (_env, _creator, client) = setup();
-    assert_eq!(client.version(), String::from_str(&_env, "1.0.0"));
+    assert_eq!(client.version(), String::from_str(&_env, VERSION));
 }
 
 #[test]
@@ -774,6 +796,162 @@ fn version_is_stable_across_calls() {
     let v1 = client.version();
     let v2 = client.version();
     assert_eq!(v1, v2);
+}
+
+#[test]
+fn init_twice_is_rejected() {
+    let (env, _creator, client) = setup();
+    let admin = Address::generate(&env);
+    client.init(&admin);
+    assert_eq!(
+        client.try_init(&Address::generate(&env)),
+        Err(Ok(Error::AlreadyInitialised))
+    );
+    assert_eq!(client.admin(), admin);
+}
+
+#[test]
+fn upgrade_before_init_fails() {
+    let (env, _creator, client) = setup();
+    let wasm_hash = upload_upgrade_target(&env);
+    assert_eq!(
+        client.try_upgrade(&wasm_hash),
+        Err(Ok(Error::NotInitialised))
+    );
+}
+
+#[test]
+fn version_check() {
+    let (env, _creator, client) = setup();
+    client.init(&Address::generate(&env));
+    assert_eq!(client.get_version(), String::from_str(&env, VERSION));
+    assert!(client.is_compatible(&String::from_str(&env, VERSION)));
+    assert!(!client.is_compatible(&String::from_str(&env, "99.0.0")));
+    assert!(!client.is_compatible(&String::from_str(&env, "")));
+}
+
+#[test]
+fn too_many_or_too_long_tags_rejected() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "tags");
+    let m = String::from_str(&env, "m");
+    let nine = tags(&env, &["a", "b", "c", "d", "e", "f", "g", "h", "i"]);
+    assert_eq!(
+        client.try_register(&creator, &id, &100i128, &m, &nine),
+        Err(Ok(Error::InvalidTag))
+    );
+    let long = "x".repeat(33);
+    let too_long = tags(&env, &[long.as_str()]);
+    assert_eq!(
+        client.try_register(&creator, &id, &100i128, &m, &too_long),
+        Err(Ok(Error::InvalidTag))
+    );
+    let eight = tags(&env, &["a", "b", "c", "d", "e", "f", "g", "h"]);
+    client.register(&creator, &id, &100i128, &m, &eight);
+    assert_eq!(client.get(&id).tags.len(), 8);
+}
+
+#[test]
+fn mutations_require_creator_auth() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "auth");
+    client.register(
+        &creator,
+        &id,
+        &100i128,
+        &String::from_str(&env, "m"),
+        &empty_tags(&env),
+    );
+    assert_eq!(env.auths()[0].0, creator);
+
+    client.set_price(&id, &200i128);
+    assert_eq!(env.auths()[0].0, creator);
+
+    let new_owner = Address::generate(&env);
+    client.transfer_ownership(&id, &new_owner);
+    assert_eq!(env.auths()[0].0, creator);
+
+    // After transfer only the new owner is asked to authorize.
+    client.set_listed(&id, &false);
+    assert_eq!(env.auths()[0].0, new_owner);
+}
+
+#[test]
+fn set_price_by_non_creator_is_rejected() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "steal");
+    client.register(
+        &creator,
+        &id,
+        &100i128,
+        &String::from_str(&env, "m"),
+        &empty_tags(&env),
+    );
+
+    let mallory = Address::generate(&env);
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &mallory,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "set_price",
+            args: (id.clone(), 1i128).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_set_price(&id, &1i128).is_err());
+    assert_eq!(client.get(&id).price, 100i128);
+}
+
+/// Prints CPU / memory cost of the hot entrypoints and guards against large
+/// regressions. Run with `cargo test -p vault-registry gas -- --nocapture`.
+#[test]
+fn gas_register_and_list_budget() {
+    let (env, creator, client) = setup();
+    let ids = [
+        "g00", "g01", "g02", "g03", "g04", "g05", "g06", "g07", "g08", "g09", "g10", "g11", "g12",
+        "g13", "g14", "g15", "g16", "g17", "g18", "g19",
+    ];
+
+    env.cost_estimate().budget().reset_default();
+    client.register(
+        &creator,
+        &String::from_str(&env, "g-first"),
+        &100i128,
+        &String::from_str(&env, "ipfs://QmGas"),
+        &tags(&env, &["dataset", "research"]),
+    );
+    let reg_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+    let reg_mem = env.cost_estimate().budget().memory_bytes_cost();
+    std::println!("register: cpu={reg_cpu} mem={reg_mem}");
+
+    let first = String::from_str(&env, "g-first");
+    env.cost_estimate().budget().reset_default();
+    client.set_price(&first, &200i128);
+    std::println!(
+        "set_price: cpu={} mem={}",
+        env.cost_estimate().budget().cpu_instruction_cost(),
+        env.cost_estimate().budget().memory_bytes_cost()
+    );
+
+    env.cost_estimate().budget().reset_default();
+    client.get(&first);
+    std::println!(
+        "get: cpu={} mem={}",
+        env.cost_estimate().budget().cpu_instruction_cost(),
+        env.cost_estimate().budget().memory_bytes_cost()
+    );
+
+    register_n(&env, &creator, &client, &ids);
+    env.cost_estimate().budget().reset_default();
+    let page = client.list(&0u32, &MAX_PAGE_SIZE);
+    let list_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+    let list_mem = env.cost_estimate().budget().memory_bytes_cost();
+    std::println!("list(20): cpu={list_cpu} mem={list_mem}");
+    assert_eq!(page.len(), MAX_PAGE_SIZE);
+
+    // Network limit is 100M instructions per tx; stay well below it.
+    assert!(reg_cpu < 10_000_000, "register too expensive: {reg_cpu}");
+    assert!(list_cpu < 50_000_000, "list too expensive: {list_cpu}");
 }
 
 proptest! {

@@ -3,38 +3,43 @@
 ## Prerequisites
 
 ```bash
-# Rust + wasm target
+# Rust (rust-toolchain.toml pins stable + the wasm32v1-none target)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-rustup target add wasm32-unknown-unknown
 
-# Soroban CLI
-cargo install --locked soroban-cli
+# Stellar CLI (only needed for deploying / invoking)
+cargo install --locked stellar-cli
 ```
 
 ## Development workflow
 
+Run the same checks as CI before pushing:
+
 ```bash
-# Run all tests
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-
-# Format
-cargo fmt
-
-# Lint
-cargo clippy --workspace -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 # Build WASM (production)
-cargo build --target wasm32-unknown-unknown --release --workspace
+cargo build --target wasm32v1-none --release --workspace
 ```
+
+Notes:
+
+- `test_snapshots/` directories are generated on every test run and are git-ignored.
+- `contracts/vault-registry/fixtures/vault_registry_upgrade_target.wasm` is the
+  prebuilt WASM the upgrade tests upgrade to. Refresh it with `make fixture`
+  in `contracts/vault-registry` if the registry's interface changes.
+- Error codes are part of the public ABI: append new variants, never renumber.
 
 ## Adding a new contract
 
 1. `mkdir -p contracts/my-contract/src`
 2. Add `Cargo.toml` (see `access-lease` as template)
-3. Write `src/lib.rs`
+3. Write `src/lib.rs` with a `#[cfg(test)] mod tests`
 4. Add `"contracts/my-contract"` to workspace `Cargo.toml`
-5. Write tests in `src/test.rs`
-6. Document all public functions in README
+5. Add a test step to `.github/workflows/ci.yml` and the deploy workflows
+6. Document the interface in `README.md` and `docs/CONTRACTS.md`
 
 ## Documentation
 
@@ -58,3 +63,4 @@ Documentation changes should accompany the code changes in the same PR — do no
 feat(access-lease): add batch revoke function
 fix(subscription): handle expired renewal correctly  
 test(vault-registry): add max-tag edge case
+```
