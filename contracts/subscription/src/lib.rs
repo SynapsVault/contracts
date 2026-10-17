@@ -71,6 +71,8 @@ pub enum Error {
     Overflow = 11,
     /// `plan_id` is empty or exceeds the maximum allowed length.
     InvalidPlanId = 12,
+    /// The new admin address is the same as the current admin address.
+    SameAdmin = 13,
 }
 
 #[contractevent(topics = ["init"], data_format = "single-value")]
@@ -169,6 +171,10 @@ impl SubscriptionManager {
 
     pub fn set_admin(env: Env, new_admin: Address) -> Result<(), Error> {
         Self::require_admin(&env)?;
+        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if current_admin == new_admin {
+            return Err(Error::SameAdmin);
+        }
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         SetAdminEvent { new_admin }.publish(&env);
         Ok(())
@@ -537,6 +543,15 @@ mod tests {
             },
         }]);
         assert!(c.client.try_set_admin(&new_admin).is_err());
+    }
+
+    #[test]
+    fn set_admin_to_same_admin_fails() {
+        let c = setup();
+        assert_eq!(
+            c.client.try_set_admin(&c.admin),
+            Err(Ok(Error::SameAdmin))
+        );
     }
 
     #[test]

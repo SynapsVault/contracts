@@ -193,6 +193,19 @@ impl AccessLease {
         env.storage().persistent().extend_ttl(&key, BUMP_THRESH, BUMP);
         GrantEvent { resource_id, buyer, expires_at }.publish(&env);
         Ok(lease)
+        Self::grant_lease_internal(&env, resource_id, buyer, duration_ledgers)
+    }
+
+    pub fn grant_leases(
+        env: Env,
+        requests: soroban_sdk::Vec<(String, Address, u32)>,
+    ) -> Result<soroban_sdk::Vec<Lease>, Error> {
+        Self::require_admin(&env)?;
+        let mut leases = soroban_sdk::Vec::new(&env);
+        for req in requests.iter() {
+            leases.push_back(Self::grant_lease_internal(&env, req.0, req.1, req.2)?);
+        }
+        Ok(leases)
     }
 
     pub fn extend_lease(
@@ -286,6 +299,42 @@ impl AccessLease {
         env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
         Ok(())
     }
+
+    fn grant_lease_internal(
+        env: &Env,
+        resource_id: String,
+        buyer: Address,
+        duration_ledgers: u32,
+    ) -> Result<Lease, Error> {
+        if resource_id.len() == 0 || resource_id.len() > MAX_RESOURCE_ID_LEN {
+            return Err(Error::InvalidResourceId);
+        }
+        if duration_ledgers == 0 {
+            return Err(Error::InvalidDuration);
+        }
+        let key = DataKey::Lease(resource_id.clone(), buyer.clone());
+        let now = env.ledger().sequence();
+        
+        if let Some(existing) = env.storage().persistent().get::<_, Lease>(&key) {
+            if existing.expires_at > now {
+                return Err(Error::AlreadyActive);
+            }
+        }
+        
+        let expires_at = now.checked_add(duration_ledgers).ok_or(Error::InvalidDuration)?;
+        let lease = Lease {
+            resource_id: resource_id.clone(),
+            buyer: buyer.clone(),
+            granted_at: now,
+            expires_at,
+            duration_ledgers,
+        };
+        
+        env.storage().persistent().set(&key, &lease);
+        env.storage().persistent().extend_ttl(&key, BUMP_THRESH, BUMP);
+        GrantEvent { resource_id, buyer, expires_at }.publish(env);
+        Ok(lease)
+    }
 }
 
 #[cfg(test)]
@@ -294,7 +343,7 @@ mod tests {
     use soroban_sdk::{
         symbol_short,
         testutils::{Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke},
-        vec, Address, Env, IntoVal, String,
+        vec, Address, BytesN, Env, IntoVal, String,
     };
 
     fn setup<'a>() -> (Env, AccessLeaseClient<'a>, Address) {
@@ -325,6 +374,26 @@ mod tests {
         assert_eq!(lease.expires_at, lease.granted_at + 1000);
         assert!(client.is_valid(&resource_id, &buyer));
         assert_eq!(client.get_lease(&resource_id, &buyer), lease);
+    }
+
+    #[test]
+    fn test_grant_leases_batch() {
+        let (env, client, _admin) = setup();
+        let b1 = Address::generate(&env);
+        let b2 = Address::generate(&env);
+        let rid1 = String::from_str(&env, "r1");
+        let rid2 = String::from_str(&env, "r2");
+
+        let mut requests = soroban_sdk::Vec::new(&env);
+        requests.push_back((rid1.clone(), b1.clone(), 100u32));
+        requests.push_back((rid2.clone(), b2.clone(), 200u32));
+
+        let leases = client.grant_leases(&requests);
+        assert_eq!(leases.len(), 2);
+        assert!(client.is_valid(&rid1, &b1));
+        assert!(client.is_valid(&rid2, &b2));
+        assert_eq!(leases.get_unchecked(0).duration_ledgers, 100);
+        assert_eq!(leases.get_unchecked(1).duration_ledgers, 200);
     }
 
     #[test]
@@ -411,6 +480,40 @@ mod tests {
             },
         }]);
         assert!(client.try_set_admin(&new_admin).is_err());
+    }
+
+    #[test]
+    fn upgrade_success() {
+        let (env, client, _admin) = setup();
+        let hash = BytesN::from_array(&env, &[1; 32]);
+        client.upgrade(&hash);
+        // Auth checks passed successfully
+    }
+
+    #[test]
+    fn upgrade_by_non_admin_is_rejected() {
+        let (env, client, _admin) = setup();
+        let mallory = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1; 32]);
+        env.mock_auths(&[MockAuth {
+            address: &mallory,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "upgrade",
+                args: (hash.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_upgrade(&hash).is_err());
+    }
+
+    #[test]
+    fn upgrade_fails_before_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = AccessLeaseClient::new(&env, &env.register(AccessLease, ()));
+        let hash = BytesN::from_array(&env, &[1; 32]);
+        assert_eq!(client.try_upgrade(&hash), Err(Ok(Error::NotInitialised)));
     }
 
     #[test]
@@ -540,34 +643,84 @@ mod tests {
     /// (see docs/CONTRACTS.md).
     #[test]
     fn events_have_documented_shape() {
-        let (env, client, _admin) = setup();
+        let (env, client, admin) = setup();
         let buyer = Address::generate(&env);
         let rid = String::from_str(&env, "r");
+        let new_admin = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1; 32]);
 
         let lease = client.grant_lease(&rid, &buyer, &10u32);
-        assert_eq!(
-            env.events().all().filter_by_contract(&client.address),
-            vec![
-                &env,
-                (
-                    client.address.clone(),
-                    (symbol_short!("grant"), rid.clone(), buyer.clone()).into_val(&env),
-                    lease.expires_at.into_val(&env),
-                ),
-            ]
-        );
-
+        let extended = client.extend_lease(&rid, &buyer, &5u32);
         client.revoke_lease(&rid, &buyer);
+        client.set_admin(&new_admin);
+        client.upgrade(&hash);
+
+        let events = env.events().all();
+        let mut idx = events.len() - 6;
+
+        // 1. init (from setup)
         assert_eq!(
-            env.events().all().filter_by_contract(&client.address),
-            vec![
-                &env,
-                (
-                    client.address.clone(),
-                    (symbol_short!("revoke"), rid.clone(), buyer.clone()).into_val(&env),
-                    ().into_val(&env),
-                ),
-            ]
+            events.get_unchecked(idx),
+            (
+                client.address.clone(),
+                (symbol_short!("init"),).into_val(&env),
+                admin.into_val(&env),
+            )
+        );
+        idx += 1;
+
+        // 2. grant
+        assert_eq!(
+            events.get_unchecked(idx),
+            (
+                client.address.clone(),
+                (symbol_short!("grant"), rid.clone(), buyer.clone()).into_val(&env),
+                lease.expires_at.into_val(&env),
+            )
+        );
+        idx += 1;
+
+        // 3. extend
+        assert_eq!(
+            events.get_unchecked(idx),
+            (
+                client.address.clone(),
+                (symbol_short!("extend"), rid.clone(), buyer.clone()).into_val(&env),
+                extended.expires_at.into_val(&env),
+            )
+        );
+        idx += 1;
+
+        // 4. revoke
+        assert_eq!(
+            events.get_unchecked(idx),
+            (
+                client.address.clone(),
+                (symbol_short!("revoke"), rid.clone(), buyer.clone()).into_val(&env),
+                ().into_val(&env),
+            )
+        );
+        idx += 1;
+        
+        // 5. setadmin
+        assert_eq!(
+            events.get_unchecked(idx),
+            (
+                client.address.clone(),
+                (symbol_short!("setadmin"),).into_val(&env),
+                new_admin.into_val(&env),
+            )
+        );
+        idx += 1;
+        
+        // 6. upgrade
+        assert_eq!(
+            events.get_unchecked(idx),
+            (
+                client.address.clone(),
+                (symbol_short!("upgrade"),).into_val(&env),
+                hash.into_val(&env),
+            )
         );
     }
 
