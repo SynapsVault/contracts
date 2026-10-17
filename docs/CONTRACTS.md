@@ -22,7 +22,7 @@ storage or error codes must update this file in the same pull request.
 | `init` | One-time. A second call fails with `AlreadyInitialised` — it can never overwrite the admin. `init` does not require the admin's signature, so deploy and init in the same pipeline run. |
 | Admin rotation | `set_admin(new_admin)` on `access-lease` and `subscription`, gated by the current admin. |
 | Upgrades | `upgrade(new_wasm_hash)` — admin-only; storage is preserved. |
-| Versioning | `get_version()` returns the version recorded at `init` (crate version); `is_compatible(...)` detects stale deployments. |
+| Versioning | `get_version()` returns the version recorded at `init` (crate version); `is_compatible` differs between contracts — see [Version compatibility checks](#version-compatibility-checks). |
 | Errors | Every fallible entrypoint returns `Result<_, Error>`; codes are stable and never renumbered. |
 | Events | Defined as `#[contractevent]` types (so they appear in the contract spec and generated bindings). Topics start with a fixed symbol; data is a single value. Unit tests (`events_have_documented_shape`) pin the wire format. |
 | Cross-contract calls | Contracts in this workspace are **independent**: none of them performs a cross-contract call to another SynapsVault contract. Each contract validates only its own inputs and trusts the admin/backend to supply consistent identifiers. See [Cross-contract trust model](#cross-contract-trust-model). |
@@ -36,6 +36,45 @@ storage or error codes must update this file in the same pull request.
 | **Publisher** (`subscription`) | Creates and deactivates their own plans. |
 | **Buyer / Subscriber** | Holds leases/subscriptions; a subscriber can cancel their own subscription. |
 | **Anyone** | All read-only entrypoints (`get`, `list`, `is_valid`, `is_active`, …) are permissionless. |
+
+### Version compatibility checks
+
+`is_compatible` has the same name in every contract but answers a **different
+question** in `vault-registry` than in `access-lease` and `subscription`. Do not
+call them interchangeably.
+
+| | `vault-registry` | `access-lease`, `subscription` |
+|---|---|---|
+| Signature | `is_compatible(version: String) -> bool` | `is_compatible() -> bool` |
+| Input | A version string **supplied by the caller** | None — reads the version **stored in the contract** |
+| Compared against | The running WASM's compile-time version | The running WASM's compile-time version |
+| Rule | `major.minor` prefixes are equal (patch is ignored) | Exact string equality (`major.minor.patch`) |
+| Returns `false` when | The input is empty, longer than 32 bytes, not of the form `X.Y.Z` with numeric components (e.g. `"0.1"`, `"0.1."`, `"0.1.2.3"`), or has a different `major.minor` | No version is stored (never initialised), or the stored version differs in any component |
+| Question it answers | "Is a client/tool built against `version` compatible with this registry?" | "Does this deployment's stored state match the code now running?" |
+
+Examples, assuming the compiled version is `0.2.1`:
+
+| Call | Result |
+|---|---|
+| `vault-registry::is_compatible("0.2.0")` | `true` — same `0.2` |
+| `vault-registry::is_compatible("0.3.0")` | `false` |
+| `access-lease::is_compatible()` with stored `0.2.0` | `false` — patch differs |
+| `access-lease::is_compatible()` with stored `0.2.1` | `true` |
+
+How to use them:
+
+- **vault-registry** — call it off-chain with the version your client, SDK or
+  indexer was built for (for example the version recorded in
+  `deployed/contract-ids.env`). It does not look at storage, does not depend
+  on `init`, and is unaffected by `upgrade`/`migrate`.
+- **access-lease / subscription** — call it after a deployment or upgrade to
+  detect a stale deployment. It returns `false` right after `upgrade` (the
+  stored version is not updated by `upgrade`) until the admin runs `migrate`,
+  and `false` on a contract that was never initialised.
+
+Because the rules differ, a patch-only upgrade makes `access-lease` and
+`subscription` report `false` until `migrate` runs, while `vault-registry`
+keeps accepting clients on the same `major.minor`.
 
 ### Cross-contract trust model
 
