@@ -165,6 +165,7 @@ stellar contract invoke --id <C_LEASE_ID> \
 ### Migration notes
 
 - `upgrade` does not run data migrations. A change to a stored struct's layout needs a follow-up admin migration.
+- `upgrade` does not update the stored version. Call `migrate` as the admin afterwards so `get_version` reports the new code (see [docs/CONTRACTS.md → Upgrades and migration](docs/CONTRACTS.md#upgrades-and-migration)).
 - Always upgrade on testnet first, verify reads against existing data, then repeat the exact same hash on mainnet.
 - Keep the previous WASM hash recorded so a rollback is a single `upgrade` call.
 

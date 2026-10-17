@@ -6,6 +6,7 @@ Keep it in sync with the code: any change to a contract's public interface,
 storage or error codes must update this file in the same pull request.
 
 - [Common conventions](#common-conventions)
+  - [Upgrades and migration](#upgrades-and-migration)
 - [vault-registry](#vault-registry)
 - [access-lease](#access-lease)
 - [subscription](#subscription)
@@ -101,6 +102,71 @@ registered. Consumers should treat `access-lease` as the authority on *lease*
 existence and `vault-registry` as the authority on *resource* existence, and
 check both when both matter.
 
+### Upgrades and migration
+
+All three contracts expose the same two admin-gated entrypoints for changing
+code: `upgrade(new_wasm_hash)` and `migrate()`. Both require the stored admin's
+signature and fail with `NotInitialised` before `init`.
+
+**What `upgrade` does**
+
+- Replaces the contract's WASM with `new_wasm_hash` (which must already be
+  uploaded) via `update_current_contract`. The new code runs from the next
+  invocation onwards; the rest of the `upgrade` call still runs the old code.
+- Emits `("upgrade",)` with the new WASM hash.
+
+**What `upgrade` preserves**
+
+- The contract ID, so clients and the backend keep using the same address.
+- All storage — instance, persistent and temporary — exactly as it was. That
+  includes the admin, every resource, lease, plan and subscription, and the
+  stored version string.
+- Entry TTLs. `upgrade` does not extend the TTL of persistent entries.
+
+**What `upgrade` does *not* do**
+
+- **It does not update the stored version.** `get_version()` keeps returning
+  the version written at `init` (or by the last `migrate`) until `migrate` is
+  called. On `vault-registry`, `version()` already reports the new compiled
+  version while `get_version()` still reports the old one.
+- **It does not migrate data.** Stored values are decoded with the new code's
+  types. A layout change to a stored type (for example adding, removing or
+  reordering fields of `Resource`, `Lease`, `Plan` or `Subscription`, or
+  changing a `DataKey` variant) makes existing entries unreadable, and calls
+  that read them will trap. There is no automatic conversion.
+- It does not re-run `init`, change the admin, or reset error codes.
+
+**What `migrate` does**
+
+- Writes the running WASM's compile-time version into the stored `Version`
+  slot, so `get_version()` (and `is_compatible()`) reflect the new code, and
+  extends the instance TTL.
+- It is idempotent: calling it again just re-writes the same version.
+- It does not transform any stored data. `access-lease` emits
+  `("migrate",)` with the new version; `vault-registry` and `subscription`
+  emit no event.
+
+**Upgrade procedure**
+
+1. Upload the new WASM and get its hash (see README → Upgrades).
+2. Call `upgrade(new_wasm_hash)` as the admin.
+3. Call `migrate()` as the admin, in a separate transaction, so the stored
+   version matches the running code.
+4. Check `get_version()` and read a few existing entries to confirm they still
+   decode.
+
+**Changing a stored type safely**
+
+Because nothing is migrated automatically, a release that changes a stored
+type must either keep the old encoding readable (for example by storing the
+new shape under a new `DataKey` and falling back to the old key on read), or
+ship explicit migration logic in the new WASM that rewrites old entries.
+Test the upgrade against existing data on testnet before mainnet.
+
+**Rolling back** is another `upgrade` to the previous WASM hash, followed by
+`migrate`. It is only safe if the newer code has not written entries in a
+layout the older code cannot decode.
+
 ---
 
 ## vault-registry
@@ -138,6 +204,7 @@ pub struct Resource {
 | `init(admin)` | — (one-time) | `()` | `AlreadyInitialised` |
 | `admin()` | — | `Address` | `NotInitialised` |
 | `upgrade(new_wasm_hash)` | Admin | `()` | `NotInitialised` |
+| `migrate()` | Admin | `()` — refreshes the stored version after `upgrade` | `NotInitialised` |
 | `register(creator, id, price, metadata, tags)` | `creator` | `()` | `InvalidResourceId`, `InvalidPrice`, `MetadataTooLong`, `MetadataEmpty`, `InvalidTag`, `AlreadyRegistered` |
 | `set_price(id, new_price)` | Creator | `()` | `InvalidResourceId`, `NotFound`, `InvalidPrice` |
 | `update_metadata(id, metadata)` | Creator | `()` | `InvalidResourceId`, `NotFound`, `MetadataEmpty`, `MetadataTooLong` |
@@ -157,7 +224,7 @@ pub struct Resource {
 | `get_version()` | — | `String` (version stored at `init`) | — |
 | `is_compatible(version)` | — | `bool` — major.minor matches | — |
 
-The registry itself works without `init`; the admin is only needed for `upgrade`.
+The registry itself works without `init`; the admin is only needed for `upgrade` and `migrate`. See [Upgrades and migration](#upgrades-and-migration).
 
 ### Ownership transfer (two-step)
 
@@ -283,6 +350,7 @@ A lease is valid iff it exists and `expires_at > ledger.sequence()`.
 | `get_version()` | — | `String` | — |
 | `is_compatible()` | — | `bool` — stored version == compiled | — |
 | `upgrade(new_wasm_hash)` | Admin | `()` | `NotInitialised` |
+| `migrate()` | Admin | `()` — refreshes the stored version after `upgrade` | `NotInitialised` |
 
 ### Semantics
 
@@ -312,6 +380,7 @@ A lease is valid iff it exists and `expires_at > ledger.sequence()`.
 | `("extend", resource_id, buyer)` | new `expires_at` |
 | `("revoke", resource_id, buyer)` | `()` |
 | `("upgrade",)` | new wasm hash |
+| `("migrate",)` | new stored version |
 
 ### Errors
 
@@ -391,6 +460,7 @@ A subscription is active iff it exists and `expires_at > ledger.sequence()`.
 | `get_version()` | — | `String` | — |
 | `is_compatible()` | — | `bool` — stored version == compiled | — |
 | `upgrade(new_wasm_hash)` | Admin | `()` | `NotInitialised` |
+| `migrate()` | Admin | `()` — refreshes the stored version after `upgrade` | `NotInitialised` |
 
 ### Semantics
 
