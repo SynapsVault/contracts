@@ -10,7 +10,6 @@
 //! Only the recorded creator can mutate a resource (enforced via
 //! `require_auth`). Ownership can be transferred.
 
-use common::{BUMP, BUMP_THRESH};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN,
     ContractExecutable, Env, IntoVal, String, Val, Vec,
@@ -43,10 +42,6 @@ pub const SUBSCRIPTION_TTL_DAYS: u32 = 365;
 /// Retention window applied to this contract's persistent entries.
 const BUMP_AMOUNT: u32 = REGISTRY_TTL_DAYS * DAY_IN_LEDGERS;
 const LIFETIME_THRESHOLD: u32 = BUMP_AMOUNT - DAY_IN_LEDGERS;
-// ~5s ledgers → 17,280 per day. Persistent entries are bumped ~30 days on each
-// write so an actively-managed resource is never archived out from under us.
-const BUMP_AMOUNT: u32 = BUMP;
-const LIFETIME_THRESHOLD: u32 = BUMP_THRESH;
 /// Maximum byte length of a metadata pointer (IPFS URI, content hash, compact
 /// JSON anchor). Enforced on `register` and `update_metadata`; longer values
 /// are rejected with [`Error::MetadataTooLong`].
@@ -459,7 +454,11 @@ impl VaultRegistry {
         Self::validate_metadata_pointer(&metadata)?;
         resource.metadata = metadata.clone();
         Self::save(&env, &resource);
-        UpdateMetadataEvent { id, new_metadata: metadata }.publish(&env);
+        UpdateMetadataEvent {
+            id,
+            new_metadata: metadata,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -483,7 +482,11 @@ impl VaultRegistry {
         resource.creator.require_auth();
         resource.tags = normalised_tags.clone();
         Self::save(&env, &resource);
-        SetTagsEvent { id, tags: normalised_tags }.publish(&env);
+        SetTagsEvent {
+            id,
+            tags: normalised_tags,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -547,11 +550,7 @@ impl VaultRegistry {
         env.storage().persistent().remove(&pending_key);
         resource.creator = new_creator.clone();
         Self::save(&env, &resource);
-        TransferEvent {
-            id,
-            new_creator,
-        }
-        .publish(&env);
+        TransferEvent { id, new_creator }.publish(&env);
         Ok(())
     }
 
@@ -715,9 +714,7 @@ impl VaultRegistry {
         let page_size = limit.min(MAX_PAGE_SIZE);
         // Bound the scan window so the loop is always bounded by a constant,
         // regardless of the value of Count (fixes #69).
-        let scan_cap: u32 = page_size
-            .saturating_mul(2)
-            .saturating_add(MAX_PAGE_SIZE);
+        let scan_cap: u32 = page_size.saturating_mul(2).saturating_add(MAX_PAGE_SIZE);
         let scan_end: u32 = start.saturating_add(scan_cap);
         let mut result: Vec<Resource> = Vec::new(&env);
         let mut i = start;
@@ -848,14 +845,17 @@ impl VaultRegistry {
     /// first deployed. Falls back to the compile-time `VERSION` constant if no
     /// version has been stored yet.
     pub fn get_version(env: Env) -> String {
-        common::get_version(&env)
+        env.storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or_else(|| String::from_str(&env, VERSION))
     }
 
     /// Whether `version` is compatible with this contract. A version is
     /// considered compatible when its major/minor components match the
     /// compile-time `VERSION`.
     pub fn is_compatible(version: String) -> bool {
-        common::is_compatible(&version)
+        Self::compatibility_check(&version)
     }
 }
 
@@ -881,7 +881,7 @@ impl VaultRegistry {
     }
 
     fn validate_metadata_pointer(metadata: &String) -> Result<(), Error> {
-        if metadata.len() == 0 {
+        if metadata.is_empty() {
             return Err(Error::MetadataEmpty);
         }
         if metadata.len() > MAX_METADATA_POINTER_LEN {
@@ -919,7 +919,7 @@ impl VaultRegistry {
                     *b = b.to_ascii_lowercase();
                 }
             }
-            let lower = String::from_bytes(env, &soroban_sdk::Bytes::from_slice(env, &buf[..len as usize]));
+            let lower = String::from_bytes(env, &buf[..len as usize]);
 
             // Reject duplicate tags (after normalisation).
             for existing in normalised.iter() {
@@ -993,7 +993,9 @@ impl VaultRegistry {
     /// - empty strings,
     /// - strings longer than the 32-byte buffer,
     /// - non-numeric / malformed strings (e.g. `"abc"`, `"1."`, `"0..1"`),
-    /// - strings with fewer than two dots (no patch component, e.g. `"0.1"`).
+    /// - strings with fewer than two dots (no patch component, e.g. `"0.1"`),
+    /// - an empty, non-numeric or extra component after the minor version
+    ///   (e.g. `"0.1."`, `"0.1.x"`, `"0.1.2.3"`).
     fn compatibility_check(version: &String) -> bool {
         const BUF_LEN: usize = 32;
         let len = version.len() as usize;
@@ -1035,6 +1037,12 @@ impl VaultRegistry {
         if dots < 2 {
             // Fewer than two dots — no patch component; return empty so the
             // comparison always fails against any well-formed version.
+            return &version[..0];
+        }
+        // The patch component must be non-empty and purely numeric, which also
+        // rules out a fourth component ("0.1.2.3").
+        let patch = &version[second_dot + 1..];
+        if patch.is_empty() || !patch.iter().all(|b| b.is_ascii_digit()) {
             return &version[..0];
         }
         // Reject empty components (e.g. leading/trailing/consecutive dots).

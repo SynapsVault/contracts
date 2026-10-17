@@ -5,7 +5,6 @@
 //! Any third party can verify a buyer's access via `is_valid` without
 //! trusting the SynapsVault backend — the Stellar ledger is the source of truth.
 
-use common::{BUMP, BUMP_THRESH};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN,
     ContractExecutable, Env, String,
@@ -149,13 +148,17 @@ impl AccessLease {
     }
 
     pub fn get_version(env: Env) -> String {
-        let stored: Option<String> = env.storage().instance().get(&DataKey::Version);
-        common::get_version(&env, stored.as_ref())
+        env.storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or_else(|| String::from_str(&env, VERSION))
     }
 
     pub fn is_compatible(env: Env) -> bool {
-        let stored: Option<String> = env.storage().instance().get(&DataKey::Version);
-        common::is_compatible(&env, stored.as_ref())
+        match env.storage().instance().get::<_, String>(&DataKey::Version) {
+            Some(stored) => stored == String::from_str(&env, VERSION),
+            None => false,
+        }
     }
 
     pub fn grant_lease(
@@ -165,34 +168,6 @@ impl AccessLease {
         duration_ledgers: u32,
     ) -> Result<Lease, Error> {
         Self::require_admin(&env)?;
-        if resource_id.len() == 0 || resource_id.len() > MAX_RESOURCE_ID_LEN {
-            return Err(Error::InvalidResourceId);
-        }
-        if duration_ledgers == 0 {
-            return Err(Error::InvalidDuration);
-        }
-        let key = DataKey::Lease(resource_id.clone(), buyer.clone());
-        let now = env.ledger().sequence();
-        
-        if let Some(existing) = env.storage().persistent().get::<_, Lease>(&key) {
-            if existing.expires_at > now {
-                return Err(Error::AlreadyActive);
-            }
-        }
-        
-        let expires_at = now.checked_add(duration_ledgers).ok_or(Error::InvalidDuration)?;
-        let lease = Lease {
-            resource_id: resource_id.clone(),
-            buyer: buyer.clone(),
-            granted_at: now,
-            expires_at,
-            duration_ledgers,
-        };
-        
-        env.storage().persistent().set(&key, &lease);
-        env.storage().persistent().extend_ttl(&key, BUMP_THRESH, BUMP);
-        GrantEvent { resource_id, buyer, expires_at }.publish(&env);
-        Ok(lease)
         Self::grant_lease_internal(&env, resource_id, buyer, duration_ledgers)
     }
 
@@ -219,15 +194,28 @@ impl AccessLease {
             return Err(Error::InvalidDuration);
         }
         let key = DataKey::Lease(resource_id.clone(), buyer.clone());
-        let mut lease: Lease = env.storage().persistent().get(&key).ok_or(Error::LeaseNotFound)?;
-        
+        let mut lease: Lease = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::LeaseNotFound)?;
+
         let now = env.ledger().sequence();
         let base = lease.expires_at.max(now);
-        lease.expires_at = base.checked_add(extra_ledgers).ok_or(Error::InvalidDuration)?;
-        
+        lease.expires_at = base
+            .checked_add(extra_ledgers)
+            .ok_or(Error::InvalidDuration)?;
+
         env.storage().persistent().set(&key, &lease);
-        env.storage().persistent().extend_ttl(&key, BUMP_THRESH, BUMP);
-        ExtendEvent { resource_id, buyer, expires_at: lease.expires_at }.publish(&env);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        ExtendEvent {
+            resource_id,
+            buyer,
+            expires_at: lease.expires_at,
+        }
+        .publish(&env);
         Ok(lease)
     }
 
@@ -306,7 +294,7 @@ impl AccessLease {
         buyer: Address,
         duration_ledgers: u32,
     ) -> Result<Lease, Error> {
-        if resource_id.len() == 0 || resource_id.len() > MAX_RESOURCE_ID_LEN {
+        if resource_id.is_empty() || resource_id.len() > MAX_RESOURCE_ID_LEN {
             return Err(Error::InvalidResourceId);
         }
         if duration_ledgers == 0 {
@@ -314,14 +302,16 @@ impl AccessLease {
         }
         let key = DataKey::Lease(resource_id.clone(), buyer.clone());
         let now = env.ledger().sequence();
-        
+
         if let Some(existing) = env.storage().persistent().get::<_, Lease>(&key) {
             if existing.expires_at > now {
                 return Err(Error::AlreadyActive);
             }
         }
-        
-        let expires_at = now.checked_add(duration_ledgers).ok_or(Error::InvalidDuration)?;
+
+        let expires_at = now
+            .checked_add(duration_ledgers)
+            .ok_or(Error::InvalidDuration)?;
         let lease = Lease {
             resource_id: resource_id.clone(),
             buyer: buyer.clone(),
@@ -329,10 +319,17 @@ impl AccessLease {
             expires_at,
             duration_ledgers,
         };
-        
+
         env.storage().persistent().set(&key, &lease);
-        env.storage().persistent().extend_ttl(&key, BUMP_THRESH, BUMP);
-        GrantEvent { resource_id, buyer, expires_at }.publish(env);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        GrantEvent {
+            resource_id,
+            buyer,
+            expires_at,
+        }
+        .publish(env);
         Ok(lease)
     }
 }
@@ -345,6 +342,15 @@ mod tests {
         testutils::{Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke},
         vec, Address, BytesN, Env, IntoVal, String,
     };
+
+    /// Real WASM for success-path `upgrade` tests: the host rejects a hash
+    /// that was never uploaded. Reuses the vault-registry upgrade fixture.
+    const UPGRADE_TARGET_WASM: &[u8] =
+        include_bytes!("../../vault-registry/fixtures/vault_registry_upgrade_target.wasm");
+
+    fn uploaded_wasm_hash(env: &Env) -> BytesN<32> {
+        env.deployer().upload_contract_wasm(UPGRADE_TARGET_WASM)
+    }
 
     fn setup<'a>() -> (Env, AccessLeaseClient<'a>, Address) {
         let env = Env::default();
@@ -464,7 +470,7 @@ mod tests {
         }]);
         assert!(client.try_grant_lease(&rid, &buyer, &10u32).is_err());
     }
-    
+
     #[test]
     fn set_admin_by_non_admin_is_rejected() {
         let (env, client, _admin) = setup();
@@ -485,7 +491,7 @@ mod tests {
     #[test]
     fn upgrade_success() {
         let (env, client, _admin) = setup();
-        let hash = BytesN::from_array(&env, &[1; 32]);
+        let hash = uploaded_wasm_hash(&env);
         client.upgrade(&hash);
         // Auth checks passed successfully
     }
@@ -647,80 +653,57 @@ mod tests {
         let buyer = Address::generate(&env);
         let rid = String::from_str(&env, "r");
         let new_admin = Address::generate(&env);
-        let hash = BytesN::from_array(&env, &[1; 32]);
 
-        let lease = client.grant_lease(&rid, &buyer, &10u32);
-        let extended = client.extend_lease(&rid, &buyer, &5u32);
-        client.revoke_lease(&rid, &buyer);
-        client.set_admin(&new_admin);
-        client.upgrade(&hash);
-
-        let events = env.events().all();
-        let mut idx = events.len() - 6;
+        // `env.events().all()` only holds the events of the most recent
+        // invocation, so each call's event is checked straight after it.
+        let assert_last_event = |topics: soroban_sdk::Vec<soroban_sdk::Val>,
+                                 data: soroban_sdk::Val| {
+            assert_eq!(
+                env.events().all().filter_by_contract(&client.address),
+                vec![&env, (client.address.clone(), topics, data)]
+            );
+        };
 
         // 1. init (from setup)
-        assert_eq!(
-            events.get_unchecked(idx),
-            (
-                client.address.clone(),
-                (symbol_short!("init"),).into_val(&env),
-                admin.into_val(&env),
-            )
+        assert_last_event(
+            (symbol_short!("init"),).into_val(&env),
+            admin.into_val(&env),
         );
-        idx += 1;
 
         // 2. grant
-        assert_eq!(
-            events.get_unchecked(idx),
-            (
-                client.address.clone(),
-                (symbol_short!("grant"), rid.clone(), buyer.clone()).into_val(&env),
-                lease.expires_at.into_val(&env),
-            )
+        let lease = client.grant_lease(&rid, &buyer, &10u32);
+        assert_last_event(
+            (symbol_short!("grant"), rid.clone(), buyer.clone()).into_val(&env),
+            lease.expires_at.into_val(&env),
         );
-        idx += 1;
 
         // 3. extend
-        assert_eq!(
-            events.get_unchecked(idx),
-            (
-                client.address.clone(),
-                (symbol_short!("extend"), rid.clone(), buyer.clone()).into_val(&env),
-                extended.expires_at.into_val(&env),
-            )
+        let extended = client.extend_lease(&rid, &buyer, &5u32);
+        assert_last_event(
+            (symbol_short!("extend"), rid.clone(), buyer.clone()).into_val(&env),
+            extended.expires_at.into_val(&env),
         );
-        idx += 1;
 
         // 4. revoke
-        assert_eq!(
-            events.get_unchecked(idx),
-            (
-                client.address.clone(),
-                (symbol_short!("revoke"), rid.clone(), buyer.clone()).into_val(&env),
-                ().into_val(&env),
-            )
+        client.revoke_lease(&rid, &buyer);
+        assert_last_event(
+            (symbol_short!("revoke"), rid.clone(), buyer.clone()).into_val(&env),
+            ().into_val(&env),
         );
-        idx += 1;
-        
+
         // 5. setadmin
-        assert_eq!(
-            events.get_unchecked(idx),
-            (
-                client.address.clone(),
-                (symbol_short!("setadmin"),).into_val(&env),
-                new_admin.into_val(&env),
-            )
+        client.set_admin(&new_admin);
+        assert_last_event(
+            (symbol_short!("setadmin"),).into_val(&env),
+            new_admin.into_val(&env),
         );
-        idx += 1;
-        
-        // 6. upgrade
-        assert_eq!(
-            events.get_unchecked(idx),
-            (
-                client.address.clone(),
-                (symbol_short!("upgrade"),).into_val(&env),
-                hash.into_val(&env),
-            )
+
+        // 6. upgrade (uploading the WASM is itself a host call, so do it last)
+        let hash = uploaded_wasm_hash(&env);
+        client.upgrade(&hash);
+        assert_last_event(
+            (symbol_short!("upgrade"),).into_val(&env),
+            hash.into_val(&env),
         );
     }
 
@@ -840,3 +823,5 @@ mod tests {
         assert_eq!(client.try_migrate(), Err(Ok(Error::NotInitialised)));
     }
 }
+#[cfg(test)]
+mod expiry_props;
