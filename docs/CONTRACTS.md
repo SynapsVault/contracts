@@ -49,7 +49,7 @@ call them interchangeably.
 | Input | A version string **supplied by the caller** | None — reads the version **stored in the contract** |
 | Compared against | The running WASM's compile-time version | The running WASM's compile-time version |
 | Rule | `major.minor` prefixes are equal (patch is ignored) | Exact string equality (`major.minor.patch`) |
-| Returns `false` when | The input is empty, longer than 32 bytes, or has a different `major.minor` | No version is stored (never initialised), or the stored version differs in any component |
+| Returns `false` when | The input is empty, longer than 32 bytes, not of the form `X.Y.Z` with numeric components (e.g. `"0.1"`, `"0.1."`, `"0.1.2.3"`), or has a different `major.minor` | No version is stored (never initialised), or the stored version differs in any component |
 | Question it answers | "Is a client/tool built against `version` compatible with this registry?" | "Does this deployment's stored state match the code now running?" |
 
 Examples, assuming the compiled version is `0.2.1`:
