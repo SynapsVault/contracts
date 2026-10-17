@@ -165,6 +165,34 @@ impl AccessLease {
         duration_ledgers: u32,
     ) -> Result<Lease, Error> {
         Self::require_admin(&env)?;
+        if resource_id.len() == 0 || resource_id.len() > MAX_RESOURCE_ID_LEN {
+            return Err(Error::InvalidResourceId);
+        }
+        if duration_ledgers == 0 {
+            return Err(Error::InvalidDuration);
+        }
+        let key = DataKey::Lease(resource_id.clone(), buyer.clone());
+        let now = env.ledger().sequence();
+        
+        if let Some(existing) = env.storage().persistent().get::<_, Lease>(&key) {
+            if existing.expires_at > now {
+                return Err(Error::AlreadyActive);
+            }
+        }
+        
+        let expires_at = now.checked_add(duration_ledgers).ok_or(Error::InvalidDuration)?;
+        let lease = Lease {
+            resource_id: resource_id.clone(),
+            buyer: buyer.clone(),
+            granted_at: now,
+            expires_at,
+            duration_ledgers,
+        };
+        
+        env.storage().persistent().set(&key, &lease);
+        env.storage().persistent().extend_ttl(&key, BUMP_THRESH, BUMP);
+        GrantEvent { resource_id, buyer, expires_at }.publish(&env);
+        Ok(lease)
         Self::grant_lease_internal(&env, resource_id, buyer, duration_ledgers)
     }
 
