@@ -5,11 +5,13 @@
 //! Publishers create plans; the backend subscribes buyers after payment confirmation
 //! and renews each billing cycle. Subscribers can self-cancel with access until period end.
 
-use common::{BUMP, BUMP_THRESH, DAY};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN,
     ContractExecutable, Env, String,
 };
+
+/// Ledgers per day (~5 s per ledger).
+const DAY: u32 = 17_280;
 
 /// Length of one billing cycle in ledgers (30 days).
 pub const CYCLE: u32 = 30 * DAY;
@@ -105,7 +107,7 @@ pub struct PlanActiveEvent {
     pub active: bool,
 }
 
-#[contractevent(topics = ["subscribe"])]
+#[contractevent(topics = ["subscribe"], data_format = "vec")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubscribedEvent {
     #[topic]
@@ -117,7 +119,7 @@ pub struct SubscribedEvent {
     pub payment_reference: String,
 }
 
-#[contractevent(topics = ["renew"])]
+#[contractevent(topics = ["renew"], data_format = "vec")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RenewedEvent {
     #[topic]
@@ -181,11 +183,17 @@ impl SubscriptionManager {
     }
 
     pub fn get_version(env: Env) -> String {
-        common::get_version(&env, &DataKey::Version, VERSION)
+        env.storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or_else(|| String::from_str(&env, VERSION))
     }
 
     pub fn is_compatible(env: Env) -> bool {
-        common::is_compatible(&env, &DataKey::Version, VERSION)
+        match env.storage().instance().get::<_, String>(&DataKey::Version) {
+            Some(stored) => stored == String::from_str(&env, VERSION),
+            None => false,
+        }
     }
 
     pub fn create_plan(
@@ -195,7 +203,7 @@ impl SubscriptionManager {
         price_per_cycle: i128,
     ) -> Result<Plan, Error> {
         publisher.require_auth();
-        if plan_id.len() == 0 || plan_id.len() > MAX_PLAN_ID_LEN {
+        if plan_id.is_empty() || plan_id.len() > MAX_PLAN_ID_LEN {
             return Err(Error::InvalidPlanId);
         }
         if price_per_cycle <= 0 {
@@ -247,14 +255,14 @@ impl SubscriptionManager {
         env.storage()
             .persistent()
             .extend_ttl(&key, BUMP_THRESH, BUMP);
-            
+
         plan.publisher.require_auth();
         plan.active = active;
         env.storage().persistent().set(&key, &plan);
         env.storage()
             .persistent()
             .extend_ttl(&key, BUMP_THRESH, BUMP);
-            
+
         PlanActiveEvent { plan_id, active }.publish(&env);
         Ok(())
     }
@@ -290,7 +298,7 @@ impl SubscriptionManager {
         if let Some(s) = env.storage().persistent().get::<_, Subscription>(&key) {
             started_at = s.started_at;
             total_renewals = s.total_renewals;
-            
+
             if s.current_period_end > now {
                 if !s.cancelled {
                     return Err(Error::AlreadySubbed);
@@ -307,12 +315,12 @@ impl SubscriptionManager {
             cancelled: false,
             total_renewals,
         };
-        
+
         env.storage().persistent().set(&key, &sub);
         env.storage()
             .persistent()
             .extend_ttl(&key, BUMP_THRESH, BUMP);
-            
+
         SubscribedEvent {
             plan_id,
             subscriber,
@@ -321,18 +329,18 @@ impl SubscriptionManager {
             payment_reference,
         }
         .publish(&env);
-        
+
         Ok(sub)
     }
 
     pub fn renew(
-        env: Env, 
-        plan_id: String, 
-        subscriber: Address, 
-        payment_reference: String
+        env: Env,
+        plan_id: String,
+        subscriber: Address,
+        payment_reference: String,
     ) -> Result<Subscription, Error> {
         Self::require_admin(&env)?;
-        
+
         let plan_key = DataKey::Plan(plan_id.clone());
         let plan: Plan = env
             .storage()
@@ -342,7 +350,7 @@ impl SubscriptionManager {
         env.storage()
             .persistent()
             .extend_ttl(&plan_key, BUMP_THRESH, BUMP);
-            
+
         let key = DataKey::Sub(plan_id.clone(), subscriber.clone());
         let mut sub: Subscription = env
             .storage()
@@ -365,7 +373,7 @@ impl SubscriptionManager {
         env.storage()
             .persistent()
             .extend_ttl(&key, BUMP_THRESH, BUMP);
-            
+
         RenewedEvent {
             plan_id,
             subscriber,
@@ -374,7 +382,7 @@ impl SubscriptionManager {
             payment_reference,
         }
         .publish(&env);
-        
+
         Ok(sub)
     }
 
@@ -455,8 +463,14 @@ impl SubscriptionManager {
 
 impl SubscriptionManager {
     fn require_admin(env: &Env) -> Result<(), Error> {
-        // We catch the internal error here, but the contract entrypoint itself traps instead of returning Error::NotAdmin natively due to require_auth on the extracted wallet.
-        common::require_admin(env, &DataKey::Admin).map_err(|_| Error::NotInitialised)
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialised)?;
+        common::require_admin(env, &admin);
+        env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
+        Ok(())
     }
 }
 
@@ -475,6 +489,15 @@ mod tests {
         admin: Address,
         publisher: Address,
         plan_id: String,
+    }
+
+    /// Real WASM for success-path `upgrade` tests: the host rejects a hash
+    /// that was never uploaded. Reuses the vault-registry upgrade fixture.
+    const UPGRADE_TARGET_WASM: &[u8] =
+        include_bytes!("../../vault-registry/fixtures/vault_registry_upgrade_target.wasm");
+
+    fn uploaded_wasm_hash(env: &Env) -> BytesN<32> {
+        env.deployer().upload_contract_wasm(UPGRADE_TARGET_WASM)
     }
 
     fn setup<'a>() -> Ctx<'a> {
@@ -548,16 +571,13 @@ mod tests {
     #[test]
     fn set_admin_to_same_admin_fails() {
         let c = setup();
-        assert_eq!(
-            c.client.try_set_admin(&c.admin),
-            Err(Ok(Error::SameAdmin))
-        );
+        assert_eq!(c.client.try_set_admin(&c.admin), Err(Ok(Error::SameAdmin)));
     }
 
     #[test]
     fn upgrade_success() {
         let c = setup();
-        let hash = BytesN::from_array(&c.env, &[1; 32]);
+        let hash = uploaded_wasm_hash(&c.env);
         c.client.upgrade(&hash);
         // Validating the call succeeded through auth checks
     }
@@ -597,92 +617,59 @@ mod tests {
         let payment_ref = String::from_str(&c.env, "t1");
         let payment_ref2 = String::from_str(&c.env, "t2");
 
+        // `env.events().all()` only holds the events of the most recent
+        // invocation, so each call's event is checked straight after it.
+        let assert_last_event = |topics: soroban_sdk::Vec<soroban_sdk::Val>,
+                                 data: soroban_sdk::Val| {
+            assert_eq!(
+                c.env.events().all().filter_by_contract(&c.client.address),
+                vec![&c.env, (c.client.address.clone(), topics, data)]
+            );
+        };
+
         // 1. set_admin
         c.client.set_admin(&new_admin);
-        
+        assert_last_event(
+            (symbol_short!("setadmin"),).into_val(&c.env),
+            new_admin.into_val(&c.env),
+        );
+
         // 2. create_plan
         c.client.create_plan(&c.publisher, &plan_id2, &1000);
+        assert_last_event(
+            (symbol_short!("plan"), plan_id2.clone(), c.publisher.clone()).into_val(&c.env),
+            1000i128.into_val(&c.env),
+        );
 
         // 3. subscribe
         let s = c.client.subscribe(&plan_id2, &sub, &payment_ref);
+        assert_last_event(
+            (symbol_short!("subscribe"), plan_id2.clone(), sub.clone()).into_val(&c.env),
+            (s.current_period_end, 1000i128, payment_ref.clone()).into_val(&c.env),
+        );
 
         // 4. renew
         advance(&c.env, 10);
         let r = c.client.renew(&plan_id2, &sub, &payment_ref2);
+        assert_last_event(
+            (symbol_short!("renew"), plan_id2.clone(), sub.clone()).into_val(&c.env),
+            (r.current_period_end, 1000i128, payment_ref2.clone()).into_val(&c.env),
+        );
 
         // 5. cancel
         c.client.cancel(&plan_id2, &sub);
+        assert_last_event(
+            (symbol_short!("cancel"), plan_id2.clone(), sub.clone()).into_val(&c.env),
+            ().into_val(&c.env),
+        );
 
         // 6. set_plan_active
         c.client.set_plan_active(&plan_id2, &false);
-
-        // Validate the structure of every event by pulling them down
-        let events = c.env.events().all();
-        let mut idx = events.len() - 6;
-
-        // set_admin
-        assert_eq!(
-            events.get_unchecked(idx),
-            (
-                c.client.address.clone(),
-                (symbol_short!("setadmin"),).into_val(&c.env),
-                new_admin.into_val(&c.env),
-            )
-        );
-        idx += 1;
-
-        // create_plan
-        assert_eq!(
-            events.get_unchecked(idx),
-            (
-                c.client.address.clone(),
-                (symbol_short!("plan"), plan_id2.clone(), c.publisher.clone()).into_val(&c.env),
-                1000i128.into_val(&c.env),
-            )
-        );
-        idx += 1;
-
-        // subscribe
-        assert_eq!(
-            events.get_unchecked(idx),
-            (
-                c.client.address.clone(),
-                (symbol_short!("subscribe"), plan_id2.clone(), sub.clone()).into_val(&c.env),
-                (s.current_period_end, 1000i128, payment_ref.clone()).into_val(&c.env),
-            )
-        );
-        idx += 1;
-
-        // renew
-        assert_eq!(
-            events.get_unchecked(idx),
-            (
-                c.client.address.clone(),
-                (symbol_short!("renew"), plan_id2.clone(), sub.clone()).into_val(&c.env),
-                (r.current_period_end, 1000i128, payment_ref2.clone()).into_val(&c.env),
-            )
-        );
-        idx += 1;
-
-        // cancel
-        assert_eq!(
-            events.get_unchecked(idx),
-            (
-                c.client.address.clone(),
-                (symbol_short!("cancel"), plan_id2.clone(), sub.clone()).into_val(&c.env),
-                ().into_val(&c.env),
-            )
-        );
-        idx += 1;
-
-        // set_plan_active
-        assert_eq!(
-            events.get_unchecked(idx),
-            (
-                c.client.address.clone(),
-                (symbol_short!("setactive"), plan_id2.clone()).into_val(&c.env),
-                false.into_val(&c.env),
-            )
+        assert_last_event(
+            (symbol_short!("setactive"), plan_id2.clone()).into_val(&c.env),
+            false.into_val(&c.env),
         );
     }
 }
+#[cfg(test)]
+mod expiry_props;

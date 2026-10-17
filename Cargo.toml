@@ -4,6 +4,7 @@ members = [
   "contracts/vault-registry",
   "contracts/access-lease",
   "contracts/subscription",
+  "contracts/common",
 ]
 
 [workspace.package]

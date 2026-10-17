@@ -2,6 +2,8 @@
 
 extern crate std;
 
+use std::string::ToString;
+
 use super::*;
 use proptest::prelude::*;
 use soroban_sdk::{
@@ -183,7 +185,8 @@ fn ownership_can_transfer() {
     );
 
     let new_owner = Address::generate(&env);
-    client.transfer_ownership(&id, &new_owner);
+    client.propose_transfer(&id, &new_owner);
+    client.accept_transfer(&id, &new_owner);
     assert_eq!(client.get(&id).creator, new_owner);
 }
 
@@ -263,7 +266,8 @@ fn transfer_ownership_keeps_count_and_order() {
 
     let new_owner = Address::generate(&env);
     let id = String::from_str(&env, "a");
-    client.transfer_ownership(&id, &new_owner);
+    client.propose_transfer(&id, &new_owner);
+    client.accept_transfer(&id, &new_owner);
 
     assert_eq!(client.count(), 2);
     let list = client.list(&0u32, &10u32, &false, &None);
@@ -330,7 +334,8 @@ fn get_owner_after_transfer() {
     );
 
     let new_owner = Address::generate(&env);
-    client.transfer_ownership(&id, &new_owner);
+    client.propose_transfer(&id, &new_owner);
+    client.accept_transfer(&id, &new_owner);
 
     assert_eq!(client.get_owner(&id), new_owner);
 }
@@ -577,7 +582,8 @@ fn transfer_ownership_reextends_resource_ttl() {
         .set_sequence_number(env.ledger().sequence() + DAY_IN_LEDGERS);
 
     let new_owner = Address::generate(&env);
-    client.transfer_ownership(&id, &new_owner);
+    client.propose_transfer(&id, &new_owner);
+    client.accept_transfer(&id, &new_owner);
     assert_eq!(
         resource_storage_ttl(&env, &client.address, &id),
         TTL_BUMP_AMOUNT
@@ -594,7 +600,7 @@ fn list_limit_capped_at_20() {
     register_n(&env, &creator, &client, &ids);
 
     // Requesting 25 items should be silently capped to 20.
-    let page = client.list(&0u32, &25u32);
+    let page = client.list(&0u32, &25u32, &false, &None);
     assert_eq!(page.len(), 20);
 }
 
@@ -758,7 +764,9 @@ fn entrypoint_behavior_regression_after_optimization() {
     client.set_listed(&id, &false);
     assert!(!client.get(&id).listed);
 
-    client.transfer_ownership(&id, &Address::generate(&env));
+    let new_owner = Address::generate(&env);
+    client.propose_transfer(&id, &new_owner);
+    client.accept_transfer(&id, &new_owner);
     assert_eq!(client.count(), 1);
 }
 
@@ -780,7 +788,7 @@ fn footprint_regression_register_and_read() {
     assert_eq!(r.metadata, metadata);
     assert!(r.listed);
 
-    let page = client.list(&0u32, &10u32);
+    let page = client.list(&0u32, &10u32, &false, &None);
     assert_eq!(page.len(), 1);
     assert_eq!(page.get(0).unwrap().id, id);
 }
@@ -869,8 +877,11 @@ fn mutations_require_creator_auth() {
     assert_eq!(env.auths()[0].0, creator);
 
     let new_owner = Address::generate(&env);
-    client.transfer_ownership(&id, &new_owner);
+    client.propose_transfer(&id, &new_owner);
     assert_eq!(env.auths()[0].0, creator);
+    // Accepting is authorised by the incoming owner (two-step transfer).
+    client.accept_transfer(&id, &new_owner);
+    assert_eq!(env.auths()[0].0, new_owner);
 
     // After transfer only the new owner is asked to authorize.
     client.set_listed(&id, &false);
@@ -944,7 +955,7 @@ fn gas_register_and_list_budget() {
 
     register_n(&env, &creator, &client, &ids);
     env.cost_estimate().budget().reset_default();
-    let page = client.list(&0u32, &MAX_PAGE_SIZE);
+    let page = client.list(&0u32, &MAX_PAGE_SIZE, &false, &None);
     let list_cpu = env.cost_estimate().budget().cpu_instruction_cost();
     let list_mem = env.cost_estimate().budget().memory_bytes_cost();
     std::println!("list(20): cpu={list_cpu} mem={list_mem}");
@@ -1001,8 +1012,8 @@ proptest! {
         id_str in r"[a-zA-Z0-9_-]{1,32}",
         price in 1..1000000000000i128,
         price_2 in 1..1000000000000i128,
-        meta_str in r"[a-zA-Z0-9:/\\._-]{0,512}",
-        meta_str_2 in r"[a-zA-Z0-9:/\\._-]{0,512}",
+        meta_str in r"[a-zA-Z0-9:/\\._-]{1,512}",
+        meta_str_2 in r"[a-zA-Z0-9:/\\._-]{1,512}",
         listed in any::<bool>(),
     ) {
         let env = Env::default();
@@ -1065,12 +1076,18 @@ fn update_metadata_event_includes_new_pointer() {
 
     client.update_metadata(&id, &new_meta);
 
-    let all = env.events().all().filter_by_contract(&client.address);
-    assert_eq!(all.len(), 1);
     // data value must be the new metadata string, not unit / empty
-    let (_contract, _topics, data) = all.get(0).unwrap();
-    let emitted: String = data.into_val(&env);
-    assert_eq!(emitted, new_meta);
+    assert_eq!(
+        env.events().all().filter_by_contract(&client.address),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("updmeta"), id.clone()).into_val(&env),
+                new_meta.into_val(&env),
+            ),
+        ]
+    );
 }
 
 // ── #81: set_listed must be a no-op when value is unchanged ──────────────────
@@ -1097,11 +1114,18 @@ fn set_listed_no_op_when_value_unchanged() {
 
     // No events emitted.
     let events = env.events().all().filter_by_contract(&client.address);
-    assert_eq!(events.len(), 0, "expected no event on no-op set_listed");
+    assert_eq!(
+        events.events().len(),
+        0,
+        "expected no event on no-op set_listed"
+    );
 
     // TTL must not have been bumped (no storage write happened).
     let ttl_after = resource_storage_ttl(&env, &client.address, &id);
-    assert_eq!(ttl_before, ttl_after, "TTL must not change on no-op set_listed");
+    assert_eq!(
+        ttl_before, ttl_after,
+        "TTL must not change on no-op set_listed"
+    );
 }
 
 /// Calling `set_listed` with a different value must still emit the event.
@@ -1120,11 +1144,19 @@ fn set_listed_emits_event_when_value_changes() {
 
     client.set_listed(&id, &false);
 
-    let events = env.events().all().filter_by_contract(&client.address);
-    assert_eq!(events.len(), 1, "expected one event when listed changes");
-    let (_contract, _topics, data) = events.get(0).unwrap();
-    let emitted: bool = data.into_val(&env);
-    assert!(!emitted);
+    assert_eq!(
+        env.events().all().filter_by_contract(&client.address),
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                // Unlisting goes through the canonical delist path.
+                (symbol_short!("delist"), id.clone()).into_val(&env),
+                creator.into_val(&env),
+            ),
+        ],
+        "expected one delist event when listed changes to false"
+    );
 }
 
 // ── #83: is_compatible must reject malformed / boundary version strings ───────
@@ -1148,7 +1180,9 @@ fn is_compatible_rejects_version_without_patch() {
 #[test]
 fn is_compatible_rejects_malformed_versions() {
     let (env, _creator, client) = setup();
-    let bad = ["", "abc", ".", "..", "1", "1.", ".0.1", "0..1", "0.1.", "0.1.2.3"];
+    let bad = [
+        "", "abc", ".", "..", "1", "1.", ".0.1", "0..1", "0.1.", "0.1.2.3",
+    ];
     for v in &bad {
         assert!(
             !client.is_compatible(&String::from_str(&env, v)),
@@ -1174,7 +1208,7 @@ fn is_compatible_accepts_different_patch() {
     );
     // A higher patch on the same major.minor is also compatible.
     let _ = compatible_alt; // used conditionally below
-    // Build a version string with the same major.minor as VERSION but patch=99.
+                            // Build a version string with the same major.minor as VERSION but patch=99.
     let version_bytes = VERSION.as_bytes();
     let mut dots = 0usize;
     let mut second_dot = version_bytes.len();
@@ -1201,7 +1235,7 @@ fn is_compatible_accepts_different_patch() {
 fn is_compatible_length_boundary() {
     let (env, _creator, client) = setup();
     // 33-character version — must be rejected by the len > BUF_LEN guard.
-    let long = "1".repeat(11) + "." + &"2".repeat(11) + "." + &"3".repeat(8); // 33 chars
+    let long = "1".repeat(11) + "." + &"2".repeat(11) + "." + &"3".repeat(9); // 33 chars
     assert_eq!(long.len(), 33);
     assert!(
         !client.is_compatible(&String::from_str(&env, &long)),

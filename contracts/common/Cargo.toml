@@ -1,7 +1,11 @@
 [package]
 name = "common"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license.workspace = true
+repository.workspace = true
 
 [lib]
 name = "common"
@@ -9,4 +13,4 @@ path = "src/lib.rs"
 crate-type = ["lib"]
 
 [dependencies]
-soroban-sdk = "20.0.0"
+soroban-sdk = { workspace = true }
