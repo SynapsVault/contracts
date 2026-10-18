@@ -967,41 +967,113 @@ fn gas_register_and_list_budget() {
 }
 
 /// Event topics/data must stay wire-compatible with what indexers expect
-/// (see docs/CONTRACTS.md).
+/// (see docs/CONTRACTS.md).  This test covers **every** event type emitted by
+/// `vault-registry` (issue #123).
+///
+/// `env.events().all()` only holds events from the most recent invocation, so
+/// each call's event is asserted immediately after that call.
 #[test]
 fn events_have_documented_shape() {
-    let (env, creator, client) = setup();
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VaultRegistry, ());
+    let client = VaultRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let new_owner = Address::generate(&env);
     let id = String::from_str(&env, "ev");
-    client.register(
-        &creator,
-        &id,
-        &100i128,
-        &String::from_str(&env, "m"),
-        &empty_tags(&env),
-    );
-    assert_eq!(
-        env.events().all().filter_by_contract(&client.address),
-        soroban_sdk::vec![
-            &env,
-            (
-                client.address.clone(),
-                (symbol_short!("register"), creator.clone()).into_val(&env),
-                id.clone().into_val(&env),
-            ),
-        ]
+    let meta = String::from_str(&env, "ipfs://QmInit");
+    let new_meta = String::from_str(&env, "ipfs://QmUpdated");
+
+    // Helper: assert the most-recent event emitted by the contract.
+    let assert_last = |topics: soroban_sdk::Vec<soroban_sdk::Val>,
+                       data: soroban_sdk::Val| {
+        assert_eq!(
+            env.events().all().filter_by_contract(&client.address),
+            soroban_sdk::vec![&env, (client.address.clone(), topics, data)]
+        );
+    };
+
+    // 1. init — ("init",) | admin
+    client.init(&admin);
+    assert_last(
+        (symbol_short!("init"),).into_val(&env),
+        admin.into_val(&env),
     );
 
+    // 2. register — ("register", creator) | id
+    client.register(&creator, &id, &100i128, &meta, &empty_tags(&env));
+    assert_last(
+        (symbol_short!("register"), creator.clone()).into_val(&env),
+        id.clone().into_val(&env),
+    );
+
+    // 3. setprice — ("setprice", id) | new_price
     client.set_price(&id, &250i128);
-    assert_eq!(
-        env.events().all().filter_by_contract(&client.address),
-        soroban_sdk::vec![
-            &env,
-            (
-                client.address.clone(),
-                (symbol_short!("setprice"), id.clone()).into_val(&env),
-                250i128.into_val(&env),
-            ),
-        ]
+    assert_last(
+        (symbol_short!("setprice"), id.clone()).into_val(&env),
+        250i128.into_val(&env),
+    );
+
+    // 4. updmeta — ("updmeta", id) | new_metadata
+    client.update_metadata(&id, &new_meta);
+    assert_last(
+        (symbol_short!("updmeta"), id.clone()).into_val(&env),
+        new_meta.into_val(&env),
+    );
+
+    // 5. settags — ("settags", id) | tags
+    let new_tags = tags(&env, &["dataset"]);
+    client.set_tags(&id, &new_tags);
+    assert_last(
+        (symbol_short!("settags"), id.clone()).into_val(&env),
+        new_tags.into_val(&env),
+    );
+
+    // 6. setlisted (listed = true, no-op is skipped; first set to false via delist)
+    //    delist — ("delist", id) | creator
+    client.delist(&id);
+    assert_last(
+        (symbol_short!("delist"), id.clone()).into_val(&env),
+        creator.clone().into_val(&env),
+    );
+
+    // 7. setlisted — ("setlisted", id) | listed  (re-listing emits setlisted)
+    client.set_listed(&id, &true);
+    assert_last(
+        (symbol_short!("setlisted"), id.clone()).into_val(&env),
+        true.into_val(&env),
+    );
+
+    // 8. proptrans — ("proptrans", id) | proposed_new_creator
+    client.propose_transfer(&id, &new_owner);
+    assert_last(
+        (symbol_short!("proptrans"), id.clone()).into_val(&env),
+        new_owner.clone().into_val(&env),
+    );
+
+    // 9. canceltrans — ("canceltrans", id) | ()
+    client.cancel_transfer(&id);
+    assert_last(
+        (symbol_short!("canceltrans"), id.clone()).into_val(&env),
+        ().into_val(&env),
+    );
+
+    // 10. transfer — ("transfer", id) | new_creator  (full two-step flow)
+    client.propose_transfer(&id, &new_owner);
+    client.accept_transfer(&id, &new_owner);
+    assert_last(
+        (symbol_short!("transfer"), id.clone()).into_val(&env),
+        new_owner.clone().into_val(&env),
+    );
+
+    // 11. upgrade — ("upgrade",) | new_wasm_hash
+    //     Done last because uploading the WASM is itself a host call.
+    let wasm_hash = upload_upgrade_target(&env);
+    client.upgrade(&wasm_hash);
+    assert_last(
+        (symbol_short!("upgrade"),).into_val(&env),
+        wasm_hash.into_val(&env),
     );
 }
 

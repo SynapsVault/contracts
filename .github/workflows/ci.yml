@@ -18,6 +18,15 @@ env:
   STELLAR_CLI_VERSION: "27.0.0"
 
 jobs:
+  check-events:
+    name: Event table sync check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check contractevent topics match docs/CONTRACTS.md
+        run: python3 scripts/check_events.py
+
   lint:
     name: Format + Clippy + Docs
     runs-on: ubuntu-latest

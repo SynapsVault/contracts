@@ -278,6 +278,8 @@ requested range, advance `start` and paginate to retrieve more results.
 | `("transfer", id)` | new creator (on `accept_transfer`) |
 | `("canceltrans", id)` | `()` |
 | `("setlisted", id)` | listed |
+| `("delist", id)` | creator |
+| `("retire", id)` | `()` |
 | `("upgrade",)` | new wasm hash |
 
 ### Errors
@@ -376,6 +378,8 @@ A lease is valid iff it exists and `expires_at > ledger.sequence()`.
 |---|---|
 | `("init",)` | admin |
 | `("setadmin",)` | new admin |
+| `("proposeadmin",)` | pending admin |
+| `("acceptadmin",)` | new admin |
 | `("grant", resource_id, buyer)` | `expires_at` |
 | `("extend", resource_id, buyer)` | new `expires_at` |
 | `("revoke", resource_id, buyer)` | `()` |
@@ -498,10 +502,8 @@ A subscription is active iff it exists and `expires_at > ledger.sequence()`.
 |---|---|
 | `("init",)` | admin |
 | `("setadmin",)` | new admin |
-| `("createplan", id)` | publisher |
-| `("setprice", id)` | new price |
+| `("plan", plan_id, publisher)` | price_per_cycle |
 | `("setactive", id)` | active |
-| `("transfer", id)` | new publisher |
 | `("subscribe", plan_id, subscriber)` | `(current_period_end, price, payment_reference)` |
 | `("renew", plan_id, subscriber)` | `(current_period_end, price, payment_reference)` |
 | `("cancel", plan_id, subscriber)` | `()` |
