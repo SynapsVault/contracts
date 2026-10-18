@@ -43,6 +43,8 @@ pub struct Lease {
 #[contracttype]
 pub enum DataKey {
     Admin,
+    /// Pending admin address awaiting acceptance via `accept_admin`.
+    PendingAdmin,
     Lease(String, Address),
     Version,
 }
@@ -59,6 +61,10 @@ pub enum Error {
     AlreadyInitialised = 7,
     LeaseExpired = 8,
     InvalidResourceId = 9,
+    /// `accept_admin` was called but no proposal is pending.
+    NoPendingAdmin = 10,
+    /// `accept_admin` was called by an address that is not the pending admin.
+    NotPendingAdmin = 11,
 }
 
 #[contractevent(topics = ["init"], data_format = "single-value")]
@@ -70,6 +76,18 @@ pub struct InitEvent {
 #[contractevent(topics = ["setadmin"], data_format = "single-value")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetAdminEvent {
+    pub new_admin: Address,
+}
+
+#[contractevent(topics = ["proposeadmin"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposeAdminEvent {
+    pub pending_admin: Address,
+}
+
+#[contractevent(topics = ["acceptadmin"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcceptAdminEvent {
     pub new_admin: Address,
 }
 
@@ -139,12 +157,81 @@ impl AccessLease {
             .ok_or(Error::NotInitialised)
     }
 
+    /// Directly rotate the admin in a single step.
+    ///
+    /// **Deprecated** — prefer the two-step [`propose_admin`] / [`accept_admin`]
+    /// flow (issue #42) to protect against mistyped addresses that would
+    /// permanently lock the contract.  This function is kept for backwards
+    /// compatibility only.
     pub fn set_admin(env: Env, new_admin: Address) -> Result<(), Error> {
         Self::require_admin(&env)?;
+        // Clear any pending proposal so it cannot be accepted after a direct
+        // rotation.
+        env.storage().instance().remove(&DataKey::PendingAdmin);
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
         SetAdminEvent { new_admin }.publish(&env);
         Ok(())
+    }
+
+    /// Step 1 of 2 — propose a new admin address.
+    ///
+    /// The current admin nominates `pending_admin`.  The proposal is stored in
+    /// instance storage and must be accepted by `pending_admin` via
+    /// [`accept_admin`] to take effect.  Calling `propose_admin` again
+    /// overwrites any previous pending proposal.
+    pub fn propose_admin(env: Env, pending_admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &pending_admin);
+        env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
+        ProposeAdminEvent { pending_admin }.publish(&env);
+        Ok(())
+    }
+
+    /// Step 2 of 2 — accept the pending admin proposal.
+    ///
+    /// `pending_admin` must sign this call.  On success the caller becomes the
+    /// new admin, the pending-admin slot is cleared, and a `setadmin` event is
+    /// emitted.  Reverts with [`Error::NoPendingAdmin`] if no proposal is
+    /// outstanding, or [`Error::NotPendingAdmin`] if the caller is not the
+    /// nominated address.
+    pub fn accept_admin(env: Env, pending_admin: Address) -> Result<(), Error> {
+        // Verify that a proposal exists and the caller matches.
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(Error::NoPendingAdmin)?;
+        if stored != pending_admin {
+            return Err(Error::NotPendingAdmin);
+        }
+        // The pending admin must authorise this call.
+        pending_admin.require_auth();
+
+        // Promote to admin.
+        env.storage()
+            .instance()
+            .set(&DataKey::Admin, &pending_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
+        AcceptAdminEvent {
+            new_admin: pending_admin.clone(),
+        }
+        .publish(&env);
+        // Also emit the canonical setadmin event for downstream indexers that
+        // only listen for that topic.
+        SetAdminEvent {
+            new_admin: pending_admin,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Return the pending admin address, if any proposal is outstanding.
+    pub fn pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     pub fn get_version(env: Env) -> String {

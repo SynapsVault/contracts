@@ -316,10 +316,7 @@ impl SubscriptionManager {
             total_renewals,
         };
 
-        env.storage().persistent().set(&key, &sub);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        Self::save_sub(&env, &key, &sub);
 
         SubscribedEvent {
             plan_id,
@@ -369,10 +366,7 @@ impl SubscriptionManager {
         sub.current_period_end = base.checked_add(CYCLE).ok_or(Error::Overflow)?;
         sub.total_renewals = sub.total_renewals.saturating_add(1);
 
-        env.storage().persistent().set(&key, &sub);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        Self::save_sub(&env, &key, &sub);
 
         RenewedEvent {
             plan_id,
@@ -401,10 +395,7 @@ impl SubscriptionManager {
             return Ok(());
         }
         sub.cancelled = true;
-        env.storage().persistent().set(&key, &sub);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        Self::save_sub(&env, &key, &sub);
         CancelledEvent {
             plan_id,
             subscriber,
@@ -471,6 +462,18 @@ impl SubscriptionManager {
         common::require_admin(env, &admin);
         env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
         Ok(())
+    }
+
+    /// Persist a [`Subscription`] and bump its TTL in one call.
+    ///
+    /// Every mutating path that touches a subscription key (`subscribe`,
+    /// `renew`, `cancel`) calls this helper instead of duplicating the
+    /// `persistent().set` + `extend_ttl` pair inline (issue #122).
+    fn save_sub(env: &Env, key: &DataKey, sub: &Subscription) {
+        env.storage().persistent().set(key, sub);
+        env.storage()
+            .persistent()
+            .extend_ttl(key, BUMP_THRESH, BUMP);
     }
 }
 
