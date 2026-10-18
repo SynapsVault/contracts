@@ -99,6 +99,8 @@ jobs:
 
   contracttype-size:
     name: #[contracttype] encoding size checks
+  test-workspace:
+    name: Test workspace
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -115,11 +117,13 @@ jobs:
 
       - name: Subscription encoding size
         run: cargo test --locked --package subscription encoding_size -- --nocapture
+      - name: Test workspace
+        run: cargo test --locked --workspace
 
   build:
     name: Build WASM
     runs-on: ubuntu-latest
-    needs: [lint, test]
+    needs: [lint, test, test-workspace]
     steps:
       - uses: actions/checkout@v7
 
