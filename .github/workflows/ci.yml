@@ -5,6 +5,9 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+  schedule:
+    # Weekly dependency audit so advisories are caught between pushes.
+    - cron: "0 6 * * 1"
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -26,6 +29,23 @@ jobs:
 
       - name: Check contractevent topics match docs/CONTRACTS.md
         run: python3 scripts/check_events.py
+
+  audit:
+    name: Dependency audit (cargo-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit workspace lockfile
+        run: cargo audit --file Cargo.lock
 
   lint:
     name: Format + Clippy + Docs
@@ -77,6 +97,8 @@ jobs:
       - name: Gas / footprint report (vault-registry)
         run: cargo test --locked --package vault-registry gas -- --nocapture
 
+  contracttype-size:
+    name: #[contracttype] encoding size checks
   test-workspace:
     name: Test workspace
     runs-on: ubuntu-latest
@@ -90,6 +112,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Lease encoding size
+        run: cargo test --locked --package access-lease encoding_size -- --nocapture
+
+      - name: Subscription encoding size
+        run: cargo test --locked --package subscription encoding_size -- --nocapture
       - name: Test workspace
         run: cargo test --locked --workspace
 

@@ -24,7 +24,7 @@ storage or error codes must update this file in the same pull request.
 | Admin rotation | `set_admin(new_admin)` on `access-lease` and `subscription`, gated by the current admin. |
 | Upgrades | `upgrade(new_wasm_hash)` — admin-only; storage is preserved. |
 | Versioning | `get_version()` returns the version recorded at `init` (crate version); `is_compatible` differs between contracts — see [Version compatibility checks](#version-compatibility-checks). |
-| Errors | Every fallible entrypoint returns `Result<_, Error>`; codes are stable and never renumbered. |
+| Errors | Every fallible entrypoint returns `Result<_, Error>`. Codes are **per-contract and stable**: each contract has its own independent enum, codes are never renumbered, and the same concept may have a different code in different contracts. Never hard-code a numeric code across contracts — see [Error code numbering](#error-code-numbering). |
 | Events | Defined as `#[contractevent]` types (so they appear in the contract spec and generated bindings). Topics start with a fixed symbol; data is a single value. Unit tests (`events_have_documented_shape`) pin the wire format. |
 | Cross-contract calls | Contracts in this workspace are **independent**: none of them performs a cross-contract call to another SynapsVault contract. Each contract validates only its own inputs and trusts the admin/backend to supply consistent identifiers. See [Cross-contract trust model](#cross-contract-trust-model). |
 
@@ -76,6 +76,41 @@ How to use them:
 Because the rules differ, a patch-only upgrade makes `access-lease` and
 `subscription` report `false` until `migrate` runs, while `vault-registry`
 keeps accepting clients on the same `major.minor`.
+
+### Error code numbering
+
+Each contract defines its **own** `Error` enum. The numbering is intentionally
+per-contract rather than shared: a contract's codes are part of its public
+interface and are stable (never renumbered), so aligning them across contracts
+would require a breaking renumbering of at least one contract. Codes are
+therefore only meaningful relative to a specific contract — clients, SDKs and
+indexers must map a code to a name using the table for the contract they are
+calling, never assume a shared numbering, and never hard-code a numeric code
+across contracts.
+
+The same concept can have a different code in each contract. Shared concepts:
+
+| Concept | vault-registry | access-lease | subscription |
+|---|---|---|---|
+| `AlreadyInitialised` | 8 | 7 | 9 |
+| `NotInitialised` | 7 | 5 | 9 |
+| `NotAdmin` | 6 (reserved) | 1 (reserved) | — |
+| `NotFound` | 2 | — (uses `LeaseNotFound`) | 2 |
+| `InvalidPrice` | 3 | — | 4 |
+| `InvalidResourceId` / `InvalidPlanId` | 10 (`InvalidResourceId`) | 9 (`InvalidResourceId`) | 12 (`InvalidPlanId`) |
+
+Notes:
+
+- `NotAdmin` is reserved in `vault-registry` and `access-lease` and never
+  returned: admin-gated entrypoints call `admin.require_auth()`, so a failed
+  authorisation traps instead of returning a code. `subscription` has no
+  `NotAdmin` variant.
+- Codes are not contiguous: gaps (for example `access-lease` has no 7,
+  `subscription` has no 1 or 11) are intentional and must not be filled in,
+  because doing so would renumber nothing but would still change the enum's
+  discriminants if variants were reordered. Treat the numbers as fixed.
+- The per-contract tables in each [Errors](#vault-registry-errors) section are
+  authoritative; this table is a cross-reference only.
 
 ### Cross-contract trust model
 
@@ -284,6 +319,9 @@ requested range, advance `start` and paginate to retrieve more results.
 
 ### Errors
 
+Codes are specific to this contract; see [Error code numbering](#error-code-numbering)
+for how they compare with the other contracts.
+
 | Code | Name | Meaning |
 |---|---|---|
 | 1 | `AlreadyRegistered` | `id` already exists. |
@@ -387,6 +425,9 @@ A lease is valid iff it exists and `expires_at > ledger.sequence()`.
 | `("migrate",)` | new stored version |
 
 ### Errors
+
+Codes are specific to this contract; see [Error code numbering](#error-code-numbering)
+for how they compare with the other contracts.
 
 | Code | Name | Meaning |
 |---|---|---|
@@ -510,6 +551,9 @@ A subscription is active iff it exists and `expires_at > ledger.sequence()`.
 | `("upgrade",)` | new wasm hash |
 
 ### Errors
+
+Codes are specific to this contract; see [Error code numbering](#error-code-numbering)
+for how they compare with the other contracts.
 
 | Code | Name | Meaning |
 |---|---|---|

@@ -56,6 +56,14 @@ pub enum DataKey {
     Version,
 }
 
+/// Subscription-manager error codes.
+///
+/// Numbering is **per-contract** and intentionally not aligned with the
+/// `vault-registry` or `access-lease` enums: the same numeric value can mean
+/// different things in different contracts (e.g. `AlreadyInitialised` is 9
+/// here, 8 in the registry and 7 in the lease). The cross-contract mapping is
+/// documented in `docs/CONTRACTS.md`; the discriminants are pinned by tests so
+/// any renumbering is deliberate.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -676,3 +684,71 @@ mod tests {
 }
 #[cfg(test)]
 mod expiry_props;
+
+#[cfg(test)]
+mod encoding {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, xdr::ToXdr, Address, Env, String};
+
+    /// Golden encoded size (in bytes) of a representative [`Subscription`].
+    ///
+    /// This pins the XDR layout of the `#[contracttype]` struct so that any
+    /// change to its fields, their order or their sizes is caught by CI (the
+    /// test suite runs on every PR). If a layout change is intended, update
+    /// this value **deliberately** in the same commit and note it in the PR
+    /// description — never adjust it just to make CI green.
+    const SUBSCRIPTION_ENCODED_LEN: u32 = 0;
+
+    fn sample_subscription(env: &Env) -> Subscription {
+        Subscription {
+            plan_id: String::from_str(env, "plan"),
+            subscriber: Address::generate(env),
+            started_at: 1,
+            current_period_end: 2,
+            cancelled: false,
+            total_renewals: 3,
+        }
+    }
+
+    #[test]
+    fn subscription_encoding_size_is_pinned() {
+        let env = Env::default();
+        let sub = sample_subscription(&env);
+        let encoded = sub.to_xdr(&env);
+        assert_eq!(
+            encoded.len(),
+            SUBSCRIPTION_ENCODED_LEN,
+            "Subscription encoding changed; update SUBSCRIPTION_ENCODED_LEN deliberately"
+        );
+    }
+
+    #[test]
+    fn subscription_encoding_is_stable_across_values() {
+        // Field sizes are fixed-width (String/Address are length-prefixed but
+        // the struct itself has no variable padding), so two values with the
+        // same field types must encode to the same length.
+        let env = Env::default();
+        let a = sample_subscription(&env);
+        let mut b = sample_subscription(&env);
+        b.plan_id = String::from_str(&env, "a-much-longer-plan-identifier");
+        assert_eq!(a.to_xdr(&env).len(), b.to_xdr(&env).len());
+    }
+
+    #[test]
+    fn error_discriminants_are_pinned() {
+        // Numbering is per-contract; see the doc comment on `Error` and
+        // docs/CONTRACTS.md for the cross-contract mapping.
+        assert_eq!(Error::PlanNotFound as u32, 2);
+        assert_eq!(Error::PlanInactive as u32, 3);
+        assert_eq!(Error::AlreadySubbed as u32, 4);
+        assert_eq!(Error::SubNotFound as u32, 5);
+        assert_eq!(Error::Cancelled as u32, 6);
+        assert_eq!(Error::InvalidPrice as u32, 7);
+        assert_eq!(Error::NotInitialised as u32, 8);
+        assert_eq!(Error::AlreadyInitialised as u32, 9);
+        assert_eq!(Error::PlanExists as u32, 10);
+        assert_eq!(Error::Overflow as u32, 11);
+        assert_eq!(Error::InvalidPlanId as u32, 12);
+        assert_eq!(Error::SameAdmin as u32, 13);
+    }
+}

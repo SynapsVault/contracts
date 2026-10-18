@@ -115,6 +115,19 @@ pub enum DataKey {
 }
 
 /// Errors returned by registry operations.
+///
+/// # Error-code numbering
+///
+/// Error codes are **per-contract**: each MindVault contract numbers its own
+/// `Error` enum independently, so the same numeric discriminant may mean
+/// different things in `vault-registry`, `access-lease` and `subscription`
+/// (for example, `AlreadyInitialised` is `8` here, `7` in `access-lease` and
+/// `9` in `subscription`). This is intentional — codes are scoped to the
+/// contract that returns them and are not a shared namespace.
+///
+/// The cross-contract mapping of error codes is documented in
+/// `docs/CONTRACTS.md`. The discriminants below are pinned by tests, so any
+/// renumbering must be a deliberate change.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -1066,3 +1079,28 @@ impl VaultRegistry {
 pub(crate) const TTL_BUMP_AMOUNT: u32 = BUMP_AMOUNT;
 
 mod test;
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::Error;
+
+    /// Pin the numeric discriminants of [`Error`] so that any renumbering is
+    /// an intentional, reviewed change. Error codes are per-contract; see the
+    /// `Error` enum docs and `docs/CONTRACTS.md` for the cross-contract map.
+    #[test]
+    fn error_discriminants_are_stable() {
+        assert_eq!(Error::AlreadyRegistered as u32, 1);
+        assert_eq!(Error::NotFound as u32, 2);
+        assert_eq!(Error::InvalidPrice as u32, 3);
+        assert_eq!(Error::MetadataTooLong as u32, 4);
+        assert_eq!(Error::InvalidTag as u32, 5);
+        assert_eq!(Error::NotAdmin as u32, 6);
+        assert_eq!(Error::NotInitialised as u32, 7);
+        assert_eq!(Error::AlreadyInitialised as u32, 8);
+        assert_eq!(Error::MetadataEmpty as u32, 9);
+        assert_eq!(Error::InvalidResourceId as u32, 10);
+        assert_eq!(Error::NoPendingTransfer as u32, 11);
+        assert_eq!(Error::NotPendingOwner as u32, 12);
+        assert_eq!(Error::ResourceRetired as u32, 13);
+    }
+}
