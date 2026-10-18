@@ -38,6 +38,9 @@ resolution is covered by a unit test in the contract's test module.
 | `vault-registry::upgrade` | admin | `upgrade_rejects_non_admin` |
 | `access-lease::init`, `subscription::init`, `vault-registry::init` | **none** — see SV-12 | — (test removed; see SV-12) |
 | `access-lease::grant_lease` / `extend_lease` / `revoke_lease` | admin | `grant_by_non_admin_is_rejected` |
+| `access-lease::set_admin` | current admin (one-step rotation) | `set_admin_by_non_admin_is_rejected` |
+| `access-lease::propose_admin` / `accept_admin` | current admin for `propose_admin`; pending admin for `accept_admin` | `set_admin_by_non_admin_is_rejected` |
+| `subscription::set_admin` | current admin | `set_admin_by_non_admin_is_rejected` |
 | `subscription::subscribe` / `renew` | admin | `subscribe_by_non_admin_is_rejected` |
 | `subscription::deactivate_plan` | publisher | `deactivate_requires_publisher_auth` |
 | `subscription::cancel` | subscriber | `cancel_keeps_access_until_period_end_and_blocks_renewal` |

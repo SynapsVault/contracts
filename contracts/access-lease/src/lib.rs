@@ -49,6 +49,15 @@ pub enum DataKey {
     Version,
 }
 
+/// Contract error codes.
+///
+/// Numbering is **per-contract** and intentionally not shared across the
+/// SynapsVault contracts: each contract owns its own error namespace, so the
+/// same numeric code may mean different things in `vault-registry`,
+/// `access-lease` and `subscription` (e.g. `AlreadyInitialised` is 8 in the
+/// registry, 7 here and 9 in the subscription contract). The cross-contract
+/// mapping is documented in `docs/CONTRACTS.md`. The discriminants are pinned
+/// by the `error_codes_are_stable` test so any renumbering must be deliberate.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -908,6 +917,65 @@ mod tests {
         env.mock_all_auths();
         let client = AccessLeaseClient::new(&env, &env.register(AccessLease, ()));
         assert_eq!(client.try_migrate(), Err(Ok(Error::NotInitialised)));
+    }
+
+    /// Pins the numeric discriminants of [`Error`].
+    ///
+    /// Error codes are part of the contract's public ABI: clients and
+    /// indexers match on the raw `u32` returned by a failed invocation, so a
+    /// renumbering is a breaking change. This test makes any such change
+    /// deliberate — update the expected values here (and the cross-contract
+    /// mapping in `docs/CONTRACTS.md`) only when the renumbering is intended.
+    #[test]
+    fn error_codes_are_stable() {
+        assert_eq!(Error::NotAdmin as u32, 1);
+        assert_eq!(Error::LeaseNotFound as u32, 2);
+        assert_eq!(Error::AlreadyActive as u32, 3);
+        assert_eq!(Error::InvalidDuration as u32, 4);
+        assert_eq!(Error::NotInitialised as u32, 5);
+        // 6 is intentionally unused (historical gap).
+        assert_eq!(Error::AlreadyInitialised as u32, 7);
+        assert_eq!(Error::LeaseExpired as u32, 8);
+        assert_eq!(Error::InvalidResourceId as u32, 9);
+        assert_eq!(Error::NoPendingAdmin as u32, 10);
+        assert_eq!(Error::NotPendingAdmin as u32, 11);
+    }
+
+    /// Golden XDR-encoded length of a representative [`Lease`].
+    ///
+    /// `Lease` is a `#[contracttype]`, so its XDR layout is part of the
+    /// on-chain storage and event ABI. Changing a field's type, order or
+    /// adding/removing a field changes the encoded size and can silently
+    /// break existing stored leases and downstream decoders.
+    ///
+    /// CI runs this test: if it fails, the `Lease` layout changed. Only update
+    /// `LEASE_XDR_LEN` after confirming the change is intentional and after
+    /// migrating any persisted data / updating `docs/CONTRACTS.md`.
+    const LEASE_XDR_LEN: u32 = 0;
+
+    #[test]
+    fn lease_xdr_encoding_size_is_stable() {
+        use soroban_sdk::xdr::ToXdr;
+
+        let env = Env::default();
+        let lease = Lease {
+            resource_id: String::from_str(&env, "res_001"),
+            buyer: Address::from_str(
+                &env,
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            ),
+            granted_at: 1_000,
+            expires_at: 2_000,
+            duration_ledgers: 1_000,
+        };
+
+        let encoded = lease.to_xdr(&env);
+        assert_eq!(
+            encoded.len(),
+            LEASE_XDR_LEN,
+            "Lease XDR encoding changed: update LEASE_XDR_LEN deliberately \
+             (and docs/CONTRACTS.md) if this layout change is intended"
+        );
     }
 }
 #[cfg(test)]
