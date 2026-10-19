@@ -268,3 +268,8 @@ MIT © 2025 Busiii-adetiba
 - #50: `[subscription]` Publishers cannot change a plan's price after creation
 - #51: `[subscription]` Plan ownership cannot be transferred (`vault-registry` supports this)
 - #53: `[subscription]` Resubscribing a cancelled-but-paid subscription adds a full cycle on top of the remaining time; confirm thi...
+
+## Handsoff notes
+
+<!-- handsoff-issue-106 -->
+- #106: [cross-cutting] Gas budget test covers only register, set_price, get and list in vault-registry; add budgets for lease and...
