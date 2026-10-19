@@ -7,6 +7,7 @@ storage or error codes must update this file in the same pull request.
 
 - [Common conventions](#common-conventions)
   - [Upgrades and migration](#upgrades-and-migration)
+  - [Access-control matrix](#access-control-matrix)
 - [vault-registry](#vault-registry)
 - [access-lease](#access-lease)
 - [subscription](#subscription)
@@ -19,6 +20,7 @@ storage or error codes must update this file in the same pull request.
 |---|---|
 | Amounts | `i128` USDC stroops (7 decimals). Always strictly positive. |
 | Time | Ledger sequence numbers (`u32`). ~5 s per ledger, 17,280 ledgers ≈ 1 day. |
+| Expiry boundary | `expires_at` is **exclusive**: a lease or subscription is valid while `expires_at > ledger.sequence()`. On the ledger whose sequence equals `expires_at` the grant is already expired. This applies uniformly to `access-lease` and `subscription`. |
 | Admin | A single admin address held in instance storage, set once by `init`. In production this is the backend platform wallet. |
 | `init` | One-time. A second call fails with `AlreadyInitialised` — it can never overwrite the admin. `init` does not require the admin's signature, so deploy and init in the same pipeline run. |
 | Admin rotation | `set_admin(new_admin)` on `access-lease` and `subscription`, gated by the current admin. |
@@ -37,6 +39,31 @@ storage or error codes must update this file in the same pull request.
 | **Publisher** (`subscription`) | Creates and deactivates their own plans. |
 | **Buyer / Subscriber** | Holds leases/subscriptions; a subscriber can cancel their own subscription. |
 | **Anyone** | All read-only entrypoints (`get`, `list`, `is_valid`, `is_active`, …) are permissionless. |
+
+### Access-control matrix
+
+Every mutating entrypoint and the signer it requires. The full matrix with
+corresponding test names — including tests for rejection of unauthorised
+callers — lives in [`SECURITY_AUDIT.md` § 2](../SECURITY_AUDIT.md#2-access-control-matrix-verified-by-tests).
+
+| Entrypoint | Required signer |
+|---|---|
+| `vault-registry::register` | `creator` |
+| `vault-registry::set_price` / `update_metadata` / `set_tags` | Stored creator |
+| `vault-registry::set_listed` / `delist` | Stored creator |
+| `vault-registry::propose_transfer` | Stored creator |
+| `vault-registry::accept_transfer` | Proposed new creator |
+| `vault-registry::cancel_transfer` | Stored creator |
+| `vault-registry::upgrade` / `migrate` | Admin |
+| `access-lease::grant_lease` / `extend_lease` / `revoke_lease` | Admin |
+| `access-lease::set_admin` / `propose_admin` / `accept_admin` | Current admin (or pending admin for `accept_admin`) |
+| `access-lease::upgrade` / `migrate` | Admin |
+| `subscription::subscribe` / `renew` | Admin |
+| `subscription::create_plan` / `deactivate_plan` / `transfer_plan` | Publisher |
+| `subscription::cancel` | Subscriber |
+| `subscription::set_admin` / `upgrade` / `migrate` | Admin |
+| `*::init` | None — see [SV-12](../SECURITY_AUDIT.md#1-findings) |
+| All `get*` / `is_valid` / `is_active` / `list` reads | None (permissionless) |
 
 ### Version compatibility checks
 

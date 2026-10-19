@@ -34,6 +34,40 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 stellar contract build
 ```
 
+### Running gas / budget tests
+
+`vault-registry` ships a dedicated test (`gas_register_and_list_budget`) that
+measures CPU instructions and memory bytes for its hot entrypoints and asserts
+upper bounds. Run it with output enabled so you can read the numbers:
+
+```bash
+cargo test -p vault-registry gas -- --nocapture
+```
+
+The test prints a table like:
+
+```
+register (2 tags): cpu=129000, mem=59000
+set_price:         cpu=98000,  mem=45000
+get:               cpu=51000,  mem=32000
+list(0, 20):       cpu=1515000, mem=652000
+```
+
+These are host-environment figures (native Rust, no WASM overhead); on-chain
+WASM execution costs more, but relative changes between revisions track
+reliably. If you change a hot-path function, run this test before and after and
+update the table in `GAS_OPTIMIZATION.md` if the numbers shift intentionally.
+
+To measure real on-chain cost, simulate against testnet with `--send=no`:
+
+```bash
+stellar contract invoke --id <CONTRACT_ID> --source-account <KEY> \
+  --network testnet --send=no -- get --id <RESOURCE_ID>
+```
+
+The CLI prints the simulated fee breakdown (instructions, ledger entries, etc.)
+without submitting a transaction.
+
 Notes:
 
 - `test_snapshots/` directories are generated on every test run and are git-ignored.
