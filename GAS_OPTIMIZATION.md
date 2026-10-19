@@ -68,6 +68,45 @@ execution costs more, but relative changes track):
 | `get` | ~51,000 | ~32,000 |
 | `list(0, 20)` | ~1,515,000 | ~652,000 |
 
+### access-lease
+
+The `gas_lease_budget` test in `access-lease` prints the CPU and memory cost of
+the hot entrypoints and asserts upper bounds, so large regressions fail CI:
+
+```bash
+cargo test -p access-lease gas -- --nocapture
+```
+
+Current numbers (host test environment, native execution — on-chain WASM
+execution costs more, but relative changes track):
+
+| Entrypoint | CPU instructions | Memory bytes |
+|---|---|---|
+| `grant` | ~112,000 | ~52,000 |
+| `revoke` | ~74,000 | ~38,000 |
+| `is_valid` | ~43,000 | ~28,000 |
+| `get` | ~41,000 | ~27,000 |
+
+### subscription
+
+The `gas_subscription_budget` test in `subscription` prints the CPU and memory
+cost of the hot entrypoints and asserts upper bounds, so large regressions fail
+CI:
+
+```bash
+cargo test -p subscription gas -- --nocapture
+```
+
+Current numbers (host test environment, native execution — on-chain WASM
+execution costs more, but relative changes track):
+
+| Entrypoint | CPU instructions | Memory bytes |
+|---|---|---|
+| `subscribe` | ~118,000 | ~55,000 |
+| `renew` | ~96,000 | ~44,000 |
+| `cancel` | ~68,000 | ~35,000 |
+| `is_active` | ~42,000 | ~27,000 |
+
 To measure real on-chain cost, simulate against testnet:
 
 ```bash
@@ -77,7 +116,7 @@ stellar contract invoke --id <CONTRACT_ID> --source-account <KEY> \
 
 ## Guidelines for future changes
 
-- Measure before and after; update the table above when an intentional change lands.
+- Measure before and after; update the tables above when an intentional change lands.
 - Prefer fewer, larger ledger entries over many small ones.
 - Never bump TTLs or write on read-only paths.
 - Keep every loop bounded by a constant.
