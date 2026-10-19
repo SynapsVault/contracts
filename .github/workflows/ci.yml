@@ -30,6 +30,15 @@ jobs:
       - name: Check contractevent topics match docs/CONTRACTS.md
         run: python3 scripts/check_events.py
 
+  check-errors:
+    name: Error table sync check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check Error enums match docs/CONTRACTS.md
+        run: python3 scripts/check_errors.py
+
   audit:
     name: Dependency audit (cargo-audit)
     runs-on: ubuntu-latest
