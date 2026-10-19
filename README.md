@@ -273,3 +273,6 @@ MIT © 2025 Busiii-adetiba
 
 <!-- handsoff-issue-106 -->
 - #106: [cross-cutting] Gas budget test covers only register, set_price, get and list in vault-registry; add budgets for lease and...
+
+<!-- handsoff-issue-116 -->
+- #116: [docs and tooling] Doc comments on Lease, Subscription and Plan use "30-day" and "ledgers" interchangeably; state the conversi...
