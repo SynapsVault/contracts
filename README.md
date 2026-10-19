@@ -223,6 +223,30 @@ Entries are TTL-bumped on every write so actively managed data is never archived
 - `is_valid` and `is_active` are fully permissionless — any frontend or smart contract can verify access without relying on SynapsVault's API.
 - All ledger-sequence arithmetic is checked; overflow returns an error instead of wrapping.
 - Every state change emits an event for off-chain indexing and auditing.
+- **Expiry boundary:** `expires_at` is **exclusive** across all three contracts. A lease or subscription is active while `expires_at > ledger.sequence()`; it is expired on the ledger whose sequence equals `expires_at`. See [`docs/CONTRACTS.md` → Common conventions](docs/CONTRACTS.md#common-conventions).
+
+### Access-control matrix
+
+Every mutating entrypoint and its required signer at a glance. The full matrix with corresponding test names lives in [`SECURITY_AUDIT.md` § 2](SECURITY_AUDIT.md#2-access-control-matrix-verified-by-tests).
+
+| Entrypoint | Required signer |
+|---|---|
+| `vault-registry::register` | `creator` |
+| `vault-registry::set_price` / `update_metadata` / `set_tags` | Stored creator |
+| `vault-registry::set_listed` / `delist` | Stored creator |
+| `vault-registry::propose_transfer` | Stored creator |
+| `vault-registry::accept_transfer` | Proposed new creator |
+| `vault-registry::cancel_transfer` | Stored creator |
+| `vault-registry::upgrade` / `migrate` | Admin |
+| `access-lease::grant_lease` / `extend_lease` / `revoke_lease` | Admin |
+| `access-lease::set_admin` / `propose_admin` / `accept_admin` | Current admin (or pending admin for `accept_admin`) |
+| `access-lease::upgrade` / `migrate` | Admin |
+| `subscription::subscribe` / `renew` | Admin |
+| `subscription::create_plan` / `deactivate_plan` / `transfer_plan` | Publisher |
+| `subscription::cancel` | Subscriber |
+| `subscription::set_admin` / `upgrade` / `migrate` | Admin |
+| `*::init` | None — see [SV-12](SECURITY_AUDIT.md#1-findings) |
+| All `get*` / `is_valid` / `is_active` / `list` reads | None (permissionless) |
 
 See [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) for findings and their status.
 

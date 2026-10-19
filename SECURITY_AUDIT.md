@@ -34,7 +34,11 @@ resolution is covered by a unit test in the contract's test module.
 | Entrypoint | Required signer | Non-signer test |
 |---|---|---|
 | `vault-registry::register` | `creator` | `mutations_require_creator_auth` |
-| `vault-registry::set_price` etc. | stored creator | `set_price_by_non_creator_is_rejected` |
+| `vault-registry::set_price` / `update_metadata` / `set_tags` | stored creator | `set_price_by_non_creator_is_rejected` |
+| `vault-registry::set_listed` / `delist` | stored creator | `mutations_require_creator_auth` |
+| `vault-registry::propose_transfer` | stored creator | `mutations_require_creator_auth` |
+| `vault-registry::accept_transfer` | proposed new creator | `accept_transfer_by_non_pending_owner_is_rejected` |
+| `vault-registry::cancel_transfer` | stored creator | `mutations_require_creator_auth` |
 | `vault-registry::upgrade` | admin | `upgrade_rejects_non_admin` |
 | `access-lease::init`, `subscription::init`, `vault-registry::init` | **none** — see SV-12 | — (test removed; see SV-12) |
 | `access-lease::grant_lease` / `extend_lease` / `revoke_lease` | admin | `grant_by_non_admin_is_rejected` |
