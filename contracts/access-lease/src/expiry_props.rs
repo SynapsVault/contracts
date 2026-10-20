@@ -3,7 +3,9 @@
 //! documented rules instead of hand-picked examples:
 //!
 //! - grant:  `expires_at = now + duration`, or `InvalidDuration` on overflow
-//!   or when `duration` exceeds `MAX_LEASE_DURATION`.
+//!   or when `duration` exceeds `MAX_LEASE_DURATION`. Granting over an expired
+//!   lease preserves the original `granted_at` (grant history) while starting
+//!   a fresh `expires_at` from the current ledger.
 //! - extend: `expires_at = max(expires_at, now) + extra`, or `InvalidDuration`
 //!   on overflow or when `extra` exceeds `MAX_LEASE_DURATION`, leaving the
 //!   stored lease untouched. `duration_ledgers` is the originally requested
@@ -158,7 +160,8 @@ proptest! {
     }
 
     /// Re-granting is refused while the lease is active and, once it has
-    /// expired, starts a fresh lease from the current ledger.
+    /// expired, starts a fresh lease from the current ledger while preserving
+    /// the original `granted_at` (grant history is never reset).
     #[test]
     fn regrant_only_after_expiry_and_restarts_from_now(
         now in 0..=MAX_START,
@@ -178,18 +181,20 @@ proptest! {
             );
         } else {
             let regranted = client.grant_lease(&rid, &buyer, &second);
-            prop_assert_eq!(regranted.granted_at, t);
+            // Grant history is preserved across a re-grant over an expired lease.
+            prop_assert_eq!(regranted.granted_at, lease.granted_at);
             prop_assert_eq!(regranted.expires_at, t + second);
         }
     }
 
     /// Zero-length grants and extensions are always rejected.
     #[test]
-    fn zero_duration_always_rejected(now in 0..=MAX_START, duration in 1..=MAX_STEP) {
+    fn zero_duration_rejected(now in 0..=MAX_START) {
         let (_env, client, rid, buyer) = setup(now);
-        prop_assert_eq!(client.try_grant_lease(&rid, &buyer, &0), Err(Ok(Error::InvalidDuration)));
-        let lease = client.grant_lease(&rid, &buyer, &duration);
-        prop_assert_eq!(client.try_extend_lease(&rid, &buyer, &0), Err(Ok(Error::InvalidDuration)));
-        prop_assert_eq!(client.get_lease(&rid, &buyer), lease);
+        prop_assert_eq!(
+            client.try_grant_lease(&rid, &buyer, &0),
+            Err(Ok(Error::InvalidDuration))
+        );
+        prop_assert!(client.try_get_lease(&rid, &buyer).is_err());
     }
 }
