@@ -6,6 +6,9 @@
 //! - extend: `expires_at = max(expires_at, now) + extra`, or `InvalidDuration`
 //!   on overflow, leaving the stored lease untouched.
 //! - valid:  a lease is valid while `expires_at > ledger.sequence()`.
+//! - ttl:    the persistent entry TTL always covers the full lease lifetime
+//!   (plus a safety margin), so a valid lease never archives before
+//!   `expires_at`.
 use super::*;
 use proptest::prelude::*;
 use soroban_sdk::{
@@ -82,6 +85,18 @@ proptest! {
         prop_assert!(!client.is_valid(&rid, &buyer));
         set_ledger(&env, lease.expires_at.saturating_add(1));
         prop_assert!(!client.is_valid(&rid, &buyer));
+    }
+
+    /// The persistent TTL of a granted lease always covers the full lease
+    /// lifetime plus a safety margin, so a valid lease never archives before
+    /// `expires_at`.
+    #[test]
+    fn grant_ttl_covers_full_lease(now in 0..=MAX_START, duration in 1..=MAX_STEP) {
+        let (env, client, rid, buyer) = setup(now);
+        let lease = client.grant_lease(&rid, &buyer, &duration);
+        let remaining = lease.expires_at.saturating_sub(now);
+        let ttl = env.storage().persistent().get_ttl(&DataKey::Lease(rid.clone(), buyer.clone()));
+        prop_assert!(ttl >= remaining, "ttl {} shorter than lease remaining {}", ttl, remaining);
     }
 
     /// `extend_lease` adds to `max(expires_at, now)`: an active lease keeps its
