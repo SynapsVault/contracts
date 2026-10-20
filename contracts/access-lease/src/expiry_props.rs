@@ -2,9 +2,11 @@
 //! `is_valid`). Each property is checked against a plain-integer model of the
 //! documented rules instead of hand-picked examples:
 //!
-//! - grant:  `expires_at = now + duration`, or `InvalidDuration` on overflow.
+//! - grant:  `expires_at = now + duration`, or `InvalidDuration` on overflow
+//!   or when `duration` exceeds `MAX_LEASE_DURATION`.
 //! - extend: `expires_at = max(expires_at, now) + extra`, or `InvalidDuration`
-//!   on overflow, leaving the stored lease untouched.
+//!   on overflow or when `extra` exceeds `MAX_LEASE_DURATION`, leaving the
+//!   stored lease untouched.
 //! - valid:  a lease is valid while `expires_at > ledger.sequence()`.
 //! - ttl:    the persistent entry TTL always covers the full lease lifetime
 //!   (plus a safety margin), so a valid lease never archives before
@@ -49,19 +51,19 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
     /// `grant_lease` sets `expires_at = now + duration` exactly, or rejects an
-    /// overflowing duration without storing anything.
+    /// overflowing or over-cap duration without storing anything.
     #[test]
     fn grant_sets_expiry_or_rejects_overflow(now in 0..=MAX_START, duration in 1..=u32::MAX) {
         let (_env, client, rid, buyer) = setup(now);
         match now.checked_add(duration) {
-            Some(expected) => {
+            Some(expected) if duration <= MAX_LEASE_DURATION => {
                 let lease = client.grant_lease(&rid, &buyer, &duration);
                 prop_assert_eq!(lease.expires_at, expected);
                 prop_assert_eq!(lease.granted_at, now);
                 prop_assert_eq!(lease.duration_ledgers, duration);
                 prop_assert!(client.is_valid(&rid, &buyer));
             }
-            None => {
+            _ => {
                 prop_assert_eq!(
                     client.try_grant_lease(&rid, &buyer, &duration),
                     Err(Ok(Error::InvalidDuration))
@@ -101,8 +103,8 @@ proptest! {
 
     /// `extend_lease` adds to `max(expires_at, now)`: an active lease keeps its
     /// remaining time, an expired one restarts from now. The result is always
-    /// later than both the old expiry and now. Overflow is rejected and leaves
-    /// the stored lease unchanged.
+    /// later than both the old expiry and now. Overflow or an over-cap `extra`
+    /// is rejected and leaves the stored lease unchanged.
     #[test]
     fn extend_adds_to_later_of_expiry_and_now(
         now in 0..=MAX_START,
@@ -116,7 +118,7 @@ proptest! {
         set_ledger(&env, t);
 
         match lease.expires_at.max(t).checked_add(extra) {
-            Some(expected) => {
+            Some(expected) if extra <= MAX_LEASE_DURATION => {
                 let extended = client.extend_lease(&rid, &buyer, &extra);
                 prop_assert_eq!(extended.expires_at, expected);
                 prop_assert!(extended.expires_at > lease.expires_at);
@@ -125,7 +127,7 @@ proptest! {
                 // Extending never rewrites when the lease was granted.
                 prop_assert_eq!(extended.granted_at, lease.granted_at);
             }
-            None => {
+            _ => {
                 prop_assert_eq!(
                     client.try_extend_lease(&rid, &buyer, &extra),
                     Err(Ok(Error::InvalidDuration))
@@ -184,5 +186,29 @@ proptest! {
         let lease = client.grant_lease(&rid, &buyer, &duration);
         prop_assert_eq!(client.try_extend_lease(&rid, &buyer, &0), Err(Ok(Error::InvalidDuration)));
         prop_assert_eq!(client.get_lease(&rid, &buyer), lease);
+    }
+
+    /// A duration exactly at `MAX_LEASE_DURATION` is accepted; one ledger
+    /// above the cap is rejected for both grant and extend.
+    #[test]
+    fn duration_cap_boundary(now in 0..=MAX_START) {
+        let (_env, client, rid, buyer) = setup(now);
+        let at_cap = client.grant_lease(&rid, &buyer, &MAX_LEASE_DURATION);
+        prop_assert_eq!(at_cap.duration_ledgers, MAX_LEASE_DURATION);
+        prop_assert_eq!(at_cap.expires_at, now + MAX_LEASE_DURATION);
+
+        let over_cap = MAX_LEASE_DURATION + 1;
+        prop_assert_eq!(
+            client.try_extend_lease(&rid, &buyer, &over_cap),
+            Err(Ok(Error::InvalidDuration))
+        );
+        prop_assert_eq!(client.get_lease(&rid, &buyer), at_cap);
+
+        let (_env2, client2, rid2, buyer2) = setup(now);
+        prop_assert_eq!(
+            client2.try_grant_lease(&rid2, &buyer2, &over_cap),
+            Err(Ok(Error::InvalidDuration))
+        );
+        prop_assert!(client2.try_get_lease(&rid2, &buyer2).is_err());
     }
 }
