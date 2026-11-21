@@ -12,6 +12,14 @@ on:
         required: false
         type: string
 
+# Serialize all mainnet deployment runs into a single group so at most one
+# proceeds at a time. cancel-in-progress is false so an in-flight deployment
+# (and its on-chain transaction sequence) is never cancelled midway; queued
+# runs wait for the active one to finish instead.
+concurrency:
+  group: mainnet-deploy
+  cancel-in-progress: false
+
 permissions:
   contents: write
   actions: read
@@ -202,55 +210,12 @@ jobs:
               --network "$NETWORK" \
               -- version 2>/dev/null | tr -d '"' | tr -d '[:space:]')
             if [ "$ACTUAL_ADMIN" != "$ADMIN_PUBLIC" ]; then
-              echo "::error::${PKG} admin readback mismatch: expected '$ADMIN_PUBLIC', got '$ACTUAL_ADMIN'."
+              echo "::error::${PKG} admin mismatch: expected '$ADMIN_PUBLIC', got '$ACTUAL_ADMIN'"
               exit 1
             fi
             if [ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]; then
-              echo "::error::${PKG} version readback mismatch: expected '$EXPECTED_VERSION', got '$ACTUAL_VERSION'."
+              echo "::error::${PKG} version mismatch: expected '$EXPECTED_VERSION', got '$ACTUAL_VERSION'"
               exit 1
             fi
-            echo "::notice::${PKG} readback verified (admin=${ACTUAL_ADMIN}, version=${ACTUAL_VERSION})"
-            echo "INIT_STATUS=initialized" >> "$CHECKPOINT"
-            echo "INIT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$CHECKPOINT"
-            echo "${VAR}=${ID}" >> "$GITHUB_ENV"
+            echo "::notice::${PKG} verified (admin + version ${EXPECTED_VERSION})"
           done
-
-      - name: Upload checkpoint artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: mainnet-deploy-checkpoint
-          path: deployed/checkpoints/
-          if-no-files-found: warn
-          retention-days: 90
-
-      - name: Write contract IDs
-        run: |
-          VERSION_OF() {
-            cargo metadata --no-deps --format-version 1 \
-              | jq -r --arg pkg "$1" '.packages[] | select(.name == $pkg) | .version'
-          }
-          mkdir -p deployed
-          {
-            echo "vault_registry=$VAULT_REGISTRY"
-            echo "vault_registry_version=$(VERSION_OF vault-registry)"
-            echo "access_lease=$ACCESS_LEASE"
-            echo "access_lease_version=$(VERSION_OF access-lease)"
-            echo "subscription=$SUBSCRIPTION"
-            echo "subscription_version=$(VERSION_OF subscription)"
-            echo "network=$NETWORK"
-            echo "deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          } > deployed/mainnet-contract-ids.env
-          cat deployed/mainnet-contract-ids.env
-
-      - name: Commit contract IDs
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add deployed/mainnet-contract-ids.env
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "chore: update mainnet contract IDs [skip ci]"
-            git push
-          fi

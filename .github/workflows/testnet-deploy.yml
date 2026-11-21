@@ -17,12 +17,26 @@ on:
       - "contracts/**"
       - ".github/workflows/testnet-deploy.yml"
 
+# Serialize deployments per network so overlapping runs cannot deploy contracts
+# or write the same manifest path concurrently.
+#
+# Cancellation behavior:
+# - `cancel-in-progress: false` means a newly queued run waits for the in-flight
+#   deployment to finish instead of cancelling it. This prevents a partially
+#   applied deployment (some contracts deployed, manifest not yet written) from
+#   being interrupted mid-flight.
+# - At most one run per network is active and one is pending; additional queued
+#   runs supersede the older pending run (GitHub keeps only the latest pending).
+# - The group is keyed on the resolved network so testnet and futurenet deploys
+#   do not block each other.
 concurrency:
-  group: testnet-deploy-${{ github.ref }}
+  group: testnet-deploy-${{ github.event.inputs.network || 'testnet' }}
   cancel-in-progress: false
 
 permissions:
   contents: read
+  actions: read
+  checks: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -32,8 +46,63 @@ env:
   FRIENDBOT_BASE_DELAY_SECONDS: "3"
 
 jobs:
+  # Gate deployment on a successful CI run for the exact commit being deployed.
+  # This prevents deploying a commit whose validation has not passed (or has
+  # failed) on main. The check queries the CI workflow's conclusion for the
+  # same SHA and fails the job if it is not `success`.
+  verify-ci:
+    name: Verify CI passed for ${{ github.sha }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful CI for the deployed commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          echo "Checking CI status for commit $SHA in $REPO"
+
+          # Look up the most recent CI workflow run for this exact commit.
+          # `gh run list` filters by workflow file and commit SHA.
+          run_json=$(gh run list \
+            --repo "$REPO" \
+            --workflow ci.yml \
+            --commit "$SHA" \
+            --limit 1 \
+            --json databaseId,status,conclusion,headSha)
+
+          count=$(echo "$run_json" | jq 'length')
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No CI run found for commit $SHA; refusing to deploy unvalidated code"
+            exit 1
+          fi
+
+          status=$(echo "$run_json" | jq -r '.[0].status')
+          conclusion=$(echo "$run_json" | jq -r '.[0].conclusion')
+          run_sha=$(echo "$run_json" | jq -r '.[0].headSha')
+
+          if [ "$run_sha" != "$SHA" ]; then
+            echo "::error::CI run SHA ($run_sha) does not match deployed commit ($SHA)"
+            exit 1
+          fi
+
+          if [ "$status" != "completed" ]; then
+            echo "::error::CI run for $SHA is not complete (status: $status); refusing to deploy"
+            exit 1
+          fi
+
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::CI run for $SHA concluded '$conclusion'; deployment blocked"
+            exit 1
+          fi
+
+          echo "CI passed for commit $SHA; proceeding with deployment"
+
   deploy:
     name: Deploy to ${{ github.event.inputs.network || 'testnet' }}
+    needs: verify-ci
     runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.network || 'testnet' }}
     steps:
@@ -198,12 +267,4 @@ jobs:
           RPC_URL: ${{ steps.net.outputs.rpc_url }}
           NETWORK_PASSPHRASE: ${{ steps.net.outputs.network_passphrase }}
         run: |
-          set -euo pipefail
-          for wasm in target/wasm32v1-none/release/*.wasm; do
-            echo "Deploying $(basename "$wasm")"
-            stellar contract deploy \
-              --wasm "$wasm" \
-              --source deployer \
-              --rpc-url "$RPC_URL" \
-              --network-passphrase "$NETWORK_PASSPHRASE"
-          done
+  
