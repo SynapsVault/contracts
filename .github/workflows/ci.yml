@@ -138,7 +138,21 @@ jobs:
         run: cargo test --locked --package subscription
 
       - name: Gas / footprint report (vault-registry)
-        run: cargo test --locked --package vault-registry gas -- --nocapture
+        # `cargo test` exits 0 when a name filter matches zero tests, which
+        # would silently skip the gas report. Run the filtered tests, then
+        # assert at least one test actually ran and report its name.
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          cargo test --locked --package vault-registry gas -- --nocapture | tee "$log"
+          ran=$(grep -E '^test .* \.\.\. ok$' "$log" || true)
+          if [ -z "$ran" ]; then
+            echo "::error::Gas filter 'gas' matched zero tests in vault-registry"
+            exit 1
+          fi
+          echo "Executed gas tests:"
+          echo "$ran"
+          echo "$ran" >> "$GITHUB_STEP_SUMMARY"
 
   test-workspace:
     name: Test workspace
@@ -155,10 +169,36 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Lease encoding size
-        run: cargo test --locked --package access-lease encoding_size -- --nocapture
+        # Guard against a zero-match filter silently passing: assert the
+        # intended test ran and report its name.
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          cargo test --locked --package access-lease encoding_size -- --nocapture | tee "$log"
+          ran=$(grep -E '^test .* \.\.\. ok$' "$log" || true)
+          if [ -z "$ran" ]; then
+            echo "::error::Encoding filter 'encoding_size' matched zero tests in access-lease"
+            exit 1
+          fi
+          echo "Executed encoding tests:"
+          echo "$ran"
+          echo "$ran" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Subscription encoding size
-        run: cargo test --locked --package subscription encoding_size -- --nocapture
+        # Same zero-match guard as the lease encoding step above.
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          cargo test --locked --package subscription encoding_size -- --nocapture | tee "$log"
+          ran=$(grep -E '^test .* \.\.\. ok$' "$log" || true)
+          if [ -z "$ran" ]; then
+            echo "::error::Encoding filter 'encoding_size' matched zero tests in subscription"
+            exit 1
+          fi
+          echo "Executed encoding tests:"
+          echo "$ran"
+          echo "$ran" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Test workspace
         run: cargo test --locked --workspace
 
