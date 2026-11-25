@@ -27,9 +27,6 @@ on:
 # - The group is keyed on the resolved network so testnet and futurenet deploys
 #   do not block each other.
 concurrency:
-  group: testnet-deploy
-  cancel-in-progress: false
-
   group: testnet-deploy-${{ github.event.inputs.network || 'testnet' }}
   cancel-in-progress: false
 
