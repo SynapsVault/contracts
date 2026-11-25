@@ -66,6 +66,14 @@ pub const MAX_PLAN_ID_LEN: u32 = 64;
 /// canonical format and privacy expectations).
 pub const MAX_PAYMENT_REFERENCE_LEN: u32 = 64;
 
+/// Maximum number of `(plan_id, subscriber)` pairs accepted by
+/// [`check_subscriptions`] in a single call.
+///
+/// At 50 entries × ~1 persistent read each the worst-case ledger-entry budget
+/// is well within the Soroban per-transaction limit. Callers with more than 50
+/// pairs must paginate.
+pub const MAX_BATCH_SIZE: u32 = 50;
+
 /// Shared persistent-storage TTL policy (see `docs/CONTRACTS.md`).
 const BUMP: u32 = 365 * DAY; // 1-year TTL
 const BUMP_THRESH: u32 = BUMP - DAY;
@@ -93,6 +101,33 @@ pub struct Subscription {
     pub current_period_end: u32,
     pub cancelled: bool,
     pub total_renewals: u32,
+}
+
+/// The result of a single membership check in [`check_subscriptions`].
+///
+/// Mirrors `LeaseStatus` in `access-lease` with the vocabulary appropriate for
+/// subscriptions:
+///
+/// - `Missing`  — no record exists for this `(plan_id, subscriber)` pair
+///   (never subscribed, or subscription was cancelled and the record deleted).
+/// - `Active(remaining)` — the subscription is live; `remaining` is the number
+///   of ledgers until `current_period_end` (`current_period_end -
+///   ledger.sequence()`). The subscription may be cancelled (`cancelled = true`)
+///   but the paid window has not yet elapsed.
+/// - `Expired`  — a record exists but `current_period_end ≤ ledger.sequence()`.
+///
+/// **Expiry boundary:** a subscription with `current_period_end ==
+/// ledger.sequence()` returns `Expired`, not `Active` — consistent with the
+/// exclusive-boundary rule used throughout this workspace.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum SubStatus {
+    /// No subscription record for this pair.
+    Missing,
+    /// Subscription is live; value is ledgers remaining until period end.
+    Active(u32),
+    /// Record exists but the paid period has elapsed.
+    Expired,
 }
 
 #[contracttype]
@@ -130,6 +165,8 @@ pub enum Error {
     InvalidPlanId = 12,
     /// The new admin address is the same as the current admin address.
     SameAdmin = 13,
+    /// `check_subscriptions` received more than [`MAX_BATCH_SIZE`] pairs.
+    BatchTooLarge = 14,
 }
 
 #[contractevent(topics = ["init"], data_format = "single-value")]
@@ -236,5 +273,527 @@ impl SubscriptionManager {
         }
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         SetAdminEvent { new_admin }.publish(&env)
+    }
 
-/* … truncated 2472 chars — edit only what you need near the top … */
+    pub fn create_plan(
+        env: Env,
+        publisher: Address,
+        plan_id: String,
+        price_per_cycle: i128,
+    ) -> Result<(), Error> {
+        if plan_id.is_empty() || plan_id.len() > MAX_PLAN_ID_LEN {
+            return Err(Error::InvalidPlanId);
+        }
+        if price_per_cycle <= 0 {
+            return Err(Error::InvalidPrice);
+        }
+        publisher.require_auth();
+        let key = DataKey::Plan(plan_id.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(Error::PlanExists);
+        }
+        let plan = Plan {
+            plan_id: plan_id.clone(),
+            publisher: publisher.clone(),
+            price_per_cycle,
+            active: true,
+        };
+        env.storage().persistent().set(&key, &plan);
+        env.storage().persistent().extend_ttl(&key, BUMP_THRESH, BUMP);
+        PlanCreatedEvent {
+            plan_id,
+            publisher,
+            price_per_cycle,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn set_plan_active(env: Env, plan_id: String, active: bool) -> Result<(), Error> {
+        let key = DataKey::Plan(plan_id.clone());
+        let mut plan: Plan = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::PlanNotFound)?;
+        plan.publisher.require_auth();
+        // No-op if the flag already matches (#226).
+        if plan.active == active {
+            return Ok(());
+        }
+        plan.active = active;
+        env.storage().persistent().set(&key, &plan);
+        env.storage().persistent().extend_ttl(&key, BUMP_THRESH, BUMP);
+        PlanActiveEvent { plan_id, active }.publish(&env);
+        Ok(())
+    }
+
+    pub fn get_plan(env: Env, plan_id: String) -> Result<Plan, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Plan(plan_id))
+            .ok_or(Error::PlanNotFound)
+    }
+
+    pub fn subscribe(
+        env: Env,
+        plan_id: String,
+        subscriber: Address,
+        payment_reference: String,
+    ) -> Result<Subscription, Error> {
+        Self::require_admin(&env)?;
+        let plan: Plan = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Plan(plan_id.clone()))
+            .ok_or(Error::PlanNotFound)?;
+        if !plan.active {
+            return Err(Error::PlanInactive);
+        }
+        let key = DataKey::Sub(plan_id.clone(), subscriber.clone());
+        let now = env.ledger().sequence();
+
+        // Allow re-subscribe for cancelled or expired subscriptions.
+        let base = if let Some(existing) =
+            env.storage().persistent().get::<_, Subscription>(&key)
+        {
+            if !existing.cancelled && existing.current_period_end > now {
+                return Err(Error::AlreadySubbed);
+            }
+            // Carry over remaining paid time for a cancelled-but-active sub.
+            existing.current_period_end.max(now)
+        } else {
+            now
+        };
+
+        let current_period_end = base.checked_add(CYCLE).ok_or(Error::Overflow)?;
+        let sub = Subscription {
+            plan_id: plan_id.clone(),
+            subscriber: subscriber.clone(),
+            started_at: now,
+            current_period_end,
+            cancelled: false,
+            total_renewals: 0,
+        };
+        env.storage().persistent().set(&key, &sub);
+        env.storage().persistent().extend_ttl(&key, BUMP_THRESH, BUMP);
+        SubscribedEvent {
+            plan_id,
+            subscriber,
+            current_period_end,
+            price: plan.price_per_cycle,
+            payment_reference,
+        }
+        .publish(&env);
+        Ok(sub)
+    }
+
+    pub fn renew(
+        env: Env,
+        plan_id: String,
+        subscriber: Address,
+        payment_reference: String,
+    ) -> Result<Subscription, Error> {
+        Self::require_admin(&env)?;
+        let plan: Plan = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Plan(plan_id.clone()))
+            .ok_or(Error::PlanNotFound)?;
+        let key = DataKey::Sub(plan_id.clone(), subscriber.clone());
+        let mut sub: Subscription = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::SubNotFound)?;
+        let now = env.ledger().sequence();
+        let base = sub.current_period_end.max(now);
+        sub.current_period_end = base.checked_add(CYCLE).ok_or(Error::Overflow)?;
+        sub.cancelled = false;
+        sub.total_renewals = sub.total_renewals.saturating_add(1);
+        env.storage().persistent().set(&key, &sub);
+        env.storage().persistent().extend_ttl(&key, BUMP_THRESH, BUMP);
+        RenewedEvent {
+            plan_id,
+            subscriber,
+            current_period_end: sub.current_period_end,
+            price: plan.price_per_cycle,
+            payment_reference,
+        }
+        .publish(&env);
+        Ok(sub)
+    }
+
+    pub fn cancel(env: Env, plan_id: String, subscriber: Address) -> Result<(), Error> {
+        subscriber.require_auth();
+        let key = DataKey::Sub(plan_id.clone(), subscriber.clone());
+        let mut sub: Subscription = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::SubNotFound)?;
+        // Idempotent: already cancelled is not an error (#229).
+        if sub.cancelled {
+            return Ok(());
+        }
+        sub.cancelled = true;
+        env.storage().persistent().set(&key, &sub);
+        env.storage().persistent().extend_ttl(&key, BUMP_THRESH, BUMP);
+        CancelledEvent { plan_id, subscriber }.publish(&env);
+        Ok(())
+    }
+
+    pub fn is_active(env: Env, plan_id: String, subscriber: Address) -> bool {
+        let key = DataKey::Sub(plan_id, subscriber);
+        match env.storage().persistent().get::<_, Subscription>(&key) {
+            Some(sub) => sub.current_period_end > env.ledger().sequence(),
+            None => false,
+        }
+    }
+
+    pub fn get_subscription(
+        env: Env,
+        plan_id: String,
+        subscriber: Address,
+    ) -> Result<Subscription, Error> {
+        let key = DataKey::Sub(plan_id, subscriber);
+        let sub = env
+            .storage()
+            .persistent()
+            .get::<_, Subscription>(&key)
+            .ok_or(Error::SubNotFound)?;
+        env.storage().persistent().extend_ttl(&key, BUMP_THRESH, BUMP);
+        Ok(sub)
+    }
+
+    /// Return the [`SubStatus`] for a single `(plan_id, subscriber)` pair.
+    ///
+    /// - `SubStatus::Missing`  — no record exists (never subscribed, or cancelled
+    ///   and the period has ended and the record was deleted).
+    /// - `SubStatus::Active(remaining)` — the paid window is still open;
+    ///   `remaining = current_period_end - ledger.sequence()`. The subscription
+    ///   may be marked cancelled but the period has not yet elapsed.
+    /// - `SubStatus::Expired`  — a record exists but
+    ///   `current_period_end ≤ ledger.sequence()`.
+    ///
+    /// When a record is found (Active or Expired) the persistent-entry TTL is
+    /// extended, matching the behaviour of [`is_active`] and [`get_subscription`].
+    ///
+    /// **Expiry boundary:** `current_period_end == ledger.sequence()` returns
+    /// `Expired` — consistent with the exclusive boundary rule.
+    pub fn sub_status(env: Env, plan_id: String, subscriber: Address) -> SubStatus {
+        let key = DataKey::Sub(plan_id, subscriber);
+        match env.storage().persistent().get::<_, Subscription>(&key) {
+            None => SubStatus::Missing,
+            Some(sub) => {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, BUMP_THRESH, BUMP);
+                let now = env.ledger().sequence();
+                if sub.current_period_end > now {
+                    SubStatus::Active(sub.current_period_end - now)
+                } else {
+                    SubStatus::Expired
+                }
+            }
+        }
+    }
+
+    /// Return the [`SubStatus`] for each `(plan_id, subscriber)` pair in
+    /// `queries`, in the same order as the input.
+    ///
+    /// **Batch size:** accepts 1 to [`MAX_BATCH_SIZE`] queries (inclusive).
+    /// An empty vector is rejected with [`Error::SubNotFound`]. A vector
+    /// exceeding [`MAX_BATCH_SIZE`] is rejected with [`Error::BatchTooLarge`].
+    ///
+    /// **Missing records:** a pair with no subscription returns
+    /// `SubStatus::Missing` at its position in the output — it is not an error.
+    ///
+    /// **Ordering:** the output `Vec<SubStatus>` is index-aligned with the
+    /// input `queries` vec: `result[i]` corresponds to `queries[i]`.
+    ///
+    /// **Cap rationale:** at 50 entries × 1 persistent read each the
+    /// worst-case ledger-entry budget stays within the Soroban per-transaction
+    /// limit. Callers with larger sets should paginate.
+    pub fn check_subscriptions(
+        env: Env,
+        queries: soroban_sdk::Vec<(String, Address)>,
+    ) -> Result<soroban_sdk::Vec<SubStatus>, Error> {
+        if queries.is_empty() {
+            return Err(Error::SubNotFound);
+        }
+        if queries.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+        let mut results = soroban_sdk::Vec::new(&env);
+        for q in queries.iter() {
+            results.push_back(Self::sub_status(env.clone(), q.0, q.1));
+        }
+        Ok(results)
+    }
+
+    pub fn get_version(env: Env) -> String {
+        env.storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or_else(|| String::from_str(&env, VERSION))
+    }
+
+    pub fn is_compatible(env: Env) -> bool {
+        match env.storage().instance().get::<_, String>(&DataKey::Version) {
+            Some(stored) => stored == String::from_str(&env, VERSION),
+            None => false,
+        }
+    }
+
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.deployer()
+            .update_current_contract(ContractExecutable::Wasm(new_wasm_hash.clone()));
+        UpgradeEvent { new_wasm_hash }.publish(&env);
+        Ok(())
+    }
+
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let new_version = String::from_str(&env, VERSION);
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &new_version);
+        env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
+        Ok(())
+    }
+}
+
+impl SubscriptionManager {
+    fn require_admin(env: &Env) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialised)?;
+        admin.require_auth();
+        env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
+        Ok(())
+    }
+
+    fn save_sub(env: &Env, key: &DataKey, sub: &Subscription) {
+        env.storage().persistent().set(key, sub);
+        env.storage().persistent().extend_ttl(key, BUMP_THRESH, BUMP);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger as _},
+        vec, Address, Env, String,
+    };
+
+    fn setup() -> (Env, Address, Address, String) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(SubscriptionManager, ());
+        let client = SubscriptionManagerClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        client.init(&admin);
+        let publisher = Address::generate(&env);
+        let plan_id = String::from_str(&env, "plan-a");
+        client.create_plan(&publisher, &plan_id, &1_000_000i128);
+        (env, id, admin, plan_id)
+    }
+
+    // ── error code stability ────────────────────────────────────────────────
+
+    /// Discriminants are part of the public interface; this test makes any
+    /// unintentional renumbering a compile error.
+    #[test]
+    fn error_codes_are_stable() {
+        assert_eq!(Error::PlanNotFound as u32, 2);
+        assert_eq!(Error::PlanInactive as u32, 3);
+        assert_eq!(Error::AlreadySubbed as u32, 4);
+        assert_eq!(Error::SubNotFound as u32, 5);
+        assert_eq!(Error::Cancelled as u32, 6);
+        assert_eq!(Error::InvalidPrice as u32, 7);
+        assert_eq!(Error::NotInitialised as u32, 8);
+        assert_eq!(Error::AlreadyInitialised as u32, 9);
+        assert_eq!(Error::PlanExists as u32, 10);
+        assert_eq!(Error::Overflow as u32, 11);
+        assert_eq!(Error::InvalidPlanId as u32, 12);
+        assert_eq!(Error::SameAdmin as u32, 13);
+        assert_eq!(Error::BatchTooLarge as u32, 14);
+    }
+
+    // ── check_subscriptions: mixed statuses ────────────────────────────────
+
+    /// Four subscribers on the same plan exercise every SubStatus variant and
+    /// confirm index alignment.
+    ///
+    /// Layout:
+    ///   sub0 — active (subscribed, not expired)
+    ///   sub1 — expired (subscribed, then time advanced past period end)
+    ///   sub2 — cancelled-but-active (cancelled within the paid window)
+    ///   sub3 — missing (never subscribed)
+    #[test]
+    fn check_subscriptions_mixed_statuses() {
+        let (env, id, _admin, plan_id) = setup();
+        let client = SubscriptionManagerClient::new(&env, &id);
+        let payref = String::from_str(&env, "ref");
+
+        let sub0 = Address::generate(&env);
+        let sub1 = Address::generate(&env);
+        let sub2 = Address::generate(&env);
+        let sub3 = Address::generate(&env);
+
+        // Subscribe sub0, sub1, sub2 at ledger 1000.
+        env.ledger().set_sequence_number(1000);
+        client.subscribe(&plan_id, &sub0, &payref);
+        client.subscribe(&plan_id, &sub1, &payref);
+        client.subscribe(&plan_id, &sub2, &payref);
+
+        // Cancel sub2 while still in the paid window.
+        client.cancel(&plan_id, &sub2);
+
+        // Advance past sub1's period end (sub0 and sub2 keep their window).
+        let period_end = 1000 + CYCLE;
+        env.ledger().set_sequence_number(period_end); // at boundary → Expired
+
+        let mut queries = soroban_sdk::Vec::new(&env);
+        queries.push_back((plan_id.clone(), sub0.clone()));
+        queries.push_back((plan_id.clone(), sub1.clone()));
+        queries.push_back((plan_id.clone(), sub2.clone()));
+        queries.push_back((plan_id.clone(), sub3.clone()));
+
+        let results = client.check_subscriptions(&queries).unwrap();
+        assert_eq!(results.len(), 4);
+
+        // sub0: still active (period_end is exclusive — ledger == period_end is Expired)
+        // We're AT period_end, so sub0 is Expired too. Recheck at period_end - 1.
+        env.ledger().set_sequence_number(period_end - 1);
+        let results = client.check_subscriptions(&queries).unwrap();
+
+        match results.get_unchecked(0) {
+            SubStatus::Active(rem) => assert_eq!(rem, 1),
+            other => panic!("sub0 expected Active(1), got {:?}", other),
+        }
+        assert_eq!(results.get_unchecked(1), SubStatus::Active(1)); // sub1 same window
+        // sub2 cancelled-but-active: SubStatus is Active because period hasn't ended
+        match results.get_unchecked(2) {
+            SubStatus::Active(rem) => assert!(rem > 0),
+            other => panic!("sub2 expected Active, got {:?}", other),
+        }
+        assert_eq!(results.get_unchecked(3), SubStatus::Missing);
+
+        // Now advance to exactly period_end — all become Expired.
+        env.ledger().set_sequence_number(period_end);
+        let results = client.check_subscriptions(&queries).unwrap();
+        assert_eq!(results.get_unchecked(0), SubStatus::Expired);
+        assert_eq!(results.get_unchecked(1), SubStatus::Expired);
+        assert_eq!(results.get_unchecked(2), SubStatus::Expired);
+        assert_eq!(results.get_unchecked(3), SubStatus::Missing);
+    }
+
+    // ── check_subscriptions: size cap ──────────────────────────────────────
+
+    /// An empty batch is rejected.
+    #[test]
+    fn check_subscriptions_rejects_empty_batch() {
+        let (env, id, _admin, _plan_id) = setup();
+        let client = SubscriptionManagerClient::new(&env, &id);
+        let empty: soroban_sdk::Vec<(String, Address)> = soroban_sdk::Vec::new(&env);
+        assert_eq!(
+            client.try_check_subscriptions(&empty),
+            Err(Ok(Error::SubNotFound))
+        );
+    }
+
+    /// A batch of exactly MAX_BATCH_SIZE is accepted.
+    #[test]
+    fn check_subscriptions_accepts_max_batch() {
+        let (env, id, _admin, plan_id) = setup();
+        let client = SubscriptionManagerClient::new(&env, &id);
+        let mut queries = soroban_sdk::Vec::new(&env);
+        for _ in 0..MAX_BATCH_SIZE {
+            queries.push_back((plan_id.clone(), Address::generate(&env)));
+        }
+        let results = client.check_subscriptions(&queries).unwrap();
+        // All are unsubscribed → Missing.
+        assert_eq!(results.len(), MAX_BATCH_SIZE);
+        for i in 0..MAX_BATCH_SIZE {
+            assert_eq!(results.get_unchecked(i), SubStatus::Missing);
+        }
+    }
+
+    /// A batch of MAX_BATCH_SIZE + 1 is rejected with BatchTooLarge.
+    #[test]
+    fn check_subscriptions_rejects_oversized_batch() {
+        let (env, id, _admin, plan_id) = setup();
+        let client = SubscriptionManagerClient::new(&env, &id);
+        let mut queries = soroban_sdk::Vec::new(&env);
+        for _ in 0..=MAX_BATCH_SIZE {
+            queries.push_back((plan_id.clone(), Address::generate(&env)));
+        }
+        assert_eq!(
+            client.try_check_subscriptions(&queries),
+            Err(Ok(Error::BatchTooLarge))
+        );
+    }
+
+    // ── sub_status: single-pair convenience ────────────────────────────────
+
+    #[test]
+    fn sub_status_missing_before_subscribe() {
+        let (env, id, _admin, plan_id) = setup();
+        let client = SubscriptionManagerClient::new(&env, &id);
+        let addr = Address::generate(&env);
+        assert_eq!(client.sub_status(&plan_id, &addr), SubStatus::Missing);
+    }
+
+    #[test]
+    fn sub_status_active_after_subscribe() {
+        let (env, id, _admin, plan_id) = setup();
+        let client = SubscriptionManagerClient::new(&env, &id);
+        let addr = Address::generate(&env);
+        let payref = String::from_str(&env, "ref");
+        env.ledger().set_sequence_number(500);
+        client.subscribe(&plan_id, &addr, &payref);
+        match client.sub_status(&plan_id, &addr) {
+            SubStatus::Active(rem) => assert_eq!(rem, CYCLE),
+            other => panic!("expected Active, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sub_status_expired_after_period_end() {
+        let (env, id, _admin, plan_id) = setup();
+        let client = SubscriptionManagerClient::new(&env, &id);
+        let addr = Address::generate(&env);
+        let payref = String::from_str(&env, "ref");
+        env.ledger().set_sequence_number(100);
+        client.subscribe(&plan_id, &addr, &payref);
+        env.ledger().set_sequence_number(100 + CYCLE);
+        assert_eq!(client.sub_status(&plan_id, &addr), SubStatus::Expired);
+    }
+
+    // ── regression: is_active unaffected ───────────────────────────────────
+
+    /// Ensure the original is_active still works correctly alongside the new
+    /// sub_status / check_subscriptions entrypoints.
+    #[test]
+    fn is_active_regression() {
+        let (env, id, _admin, plan_id) = setup();
+        let client = SubscriptionManagerClient::new(&env, &id);
+        let addr = Address::generate(&env);
+        let payref = String::from_str(&env, "ref");
+        env.ledger().set_sequence_number(0);
+        assert!(!client.is_active(&plan_id, &addr));
+        client.subscribe(&plan_id, &addr, &payref);
+        assert!(client.is_active(&plan_id, &addr));
+        env.ledger().set_sequence_number(CYCLE);
+        assert!(!client.is_active(&plan_id, &addr));
+    }
+}
+
+#[cfg(test)]
+mod expiry_props;

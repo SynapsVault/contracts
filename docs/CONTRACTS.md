@@ -65,6 +65,7 @@ callers — lives in [`SECURITY_AUDIT.md` § 2](../SECURITY_AUDIT.md#2-access-co
 | `*::init` | None — see [SV-12](../SECURITY_AUDIT.md#1-findings) |
 | All `get*` / `is_valid` / `is_active` / `list` reads | None (permissionless) |
 | `access-lease::lease_status` / `check_leases` / `extend_instance_ttl` | None (permissionless) |
+| `subscription::sub_status` / `check_subscriptions` | None (permissionless) |
 
 ### Version compatibility checks
 
@@ -129,13 +130,13 @@ The same concept can have a different code in each contract. Shared concepts:
 
 New codes added in this release:
 
-| Concept | access-lease |
-|---|---|
-| `BatchTooLarge` | 12 |
-| `NoPendingProposal` | 13 |
-| `AdminProposalExpired` | 14 |
-| `AlreadyAdmin` | 15 |
-| `AlreadyPendingAdmin` | 16 |
+| Concept | access-lease | subscription |
+|---|---|---|
+| `BatchTooLarge` | 12 | 14 |
+| `NoPendingProposal` | 13 | — |
+| `AdminProposalExpired` | 14 | — |
+| `AlreadyAdmin` | 15 | — |
+| `AlreadyPendingAdmin` | 16 | — |
 
 Notes:
 
@@ -809,23 +810,35 @@ stateDiagram-v2
 
 ```rust
 pub struct Plan {
-    pub id: String,          // unique, immutable
-    pub publisher: Address,  // only address allowed to mutate the plan
-    pub price: i128,         // USDC stroops, > 0
-    pub period_ledgers: u32, // billing period, > 0
-    pub active: bool,        // true on create
+    pub plan_id: String,
+    pub publisher: Address,
+    pub price_per_cycle: i128,
+    pub active: bool,
 }
 
 pub struct Subscription {
     pub plan_id: String,
     pub subscriber: Address,
-    pub started_at: u32,     // ledger of first subscribe
-    pub expires_at: u32,     // exclusive
-    pub period_ledgers: u32, // period as of the last subscribe/renew
+    pub started_at: u32,         // ledger of first subscribe
+    pub current_period_end: u32, // exclusive
+    pub cancelled: bool,
+    pub total_renewals: u32,
+}
+
+/// Returned by sub_status and check_subscriptions.
+pub enum SubStatus {
+    Missing,       // no record for this pair
+    Active(u32),   // live; value is ledgers until current_period_end
+    Expired,       // record exists but current_period_end <= ledger.sequence()
 }
 ```
 
-A subscription is active iff it exists and `expires_at > ledger.sequence()`.
+A subscription is active iff it exists and `current_period_end > ledger.sequence()`.
+
+| Constant | Value |
+|---|---|
+| `MAX_PLAN_ID_LEN` | 64 bytes |
+| `MAX_BATCH_SIZE` | 50 |
 
 ### Functions
 
@@ -844,6 +857,8 @@ A subscription is active iff it exists and `expires_at > ledger.sequence()`.
 | `is_active(plan_id, subscriber)` | — | `bool` | — |
 | `get_subscription(plan_id, subscriber)` | — | `Subscription` (even if expired) | `NotSubscribed` |
 | `get_plan(id)` | — | `Plan` | `NotFound` |
+| `sub_status(plan_id, subscriber)` | — | `SubStatus` — `Missing`, `Active(remaining)`, or `Expired` | — |
+| `check_subscriptions(queries)` | — | `Vec<SubStatus>` — index-aligned with input | `SubNotFound` (empty batch), `BatchTooLarge` (> `MAX_BATCH_SIZE`) |
 | `get_version()` | — | `String` | — |
 | `is_compatible()` | — | `bool` — stored version == compiled | — |
 | `upgrade(new_wasm_hash)` | Admin | `()` | `NotInitialised` |
@@ -868,7 +883,21 @@ A subscription is active iff it exists and `expires_at > ledger.sequence()`.
     and no retroactive access is granted. Callers that need to enforce a maximum
     grace window must do so off-contract before invoking `renew`.
   - Zero / overflowing extensions are rejected (`InvalidPeriod`).
-- `cancel` deletes the record.
+- `cancel` marks the subscription cancelled. Access continues until `current_period_end`. Calling `cancel` a second time is a no-op (idempotent).
+
+- **`sub_status`** returns a `SubStatus` enum with three variants:
+
+  | Variant | Meaning | `remaining` |
+  |---|---|---|
+  | `Missing` | No record exists (never subscribed, or cancelled after expiry) | — |
+  | `Active(remaining)` | Subscription is live; `remaining = current_period_end - ledger.sequence()` | > 0 |
+  | `Expired` | Record exists but `current_period_end ≤ ledger.sequence()` | 0 |
+
+  A cancelled-but-active subscription (cancelled flag set but period not yet elapsed) returns `Active` — the subscriber still has access until `current_period_end`. The persistent-entry TTL is extended when a record is found, matching `is_active` and `get_subscription`.
+
+  *Expiry boundary:* `current_period_end == ledger.sequence()` returns `Expired`, not `Active` — consistent with the exclusive-boundary rule.
+
+- **`check_subscriptions`** accepts a `Vec<(plan_id, subscriber)>` of up to `MAX_BATCH_SIZE` (50) queries and returns a `Vec<SubStatus>` that is index-aligned with the input. Missing entries return `Missing` rather than an error. An empty batch is rejected with `SubNotFound`; an oversized batch is rejected with `BatchTooLarge`. Both checks happen before any storage read. Callers with more than 50 pairs should paginate.
 
 ### Storage
 
@@ -911,3 +940,13 @@ for how they compare with the other contracts.
 | 11 | `Overflow` | Reserved error discriminant for overflow. |
 | 12 | `InvalidPlanId` | `plan_id` is empty or > 64 bytes. |
 | 13 | `SameAdmin` | The new admin address is the same as the current admin address. |
+| 14 | `BatchTooLarge` | `check_subscriptions` received more than `MAX_BATCH_SIZE` (50) pairs. |
+
+### Compatibility with existing deployments
+
+`sub_status` and `check_subscriptions` are **additive read-only entrypoints**.
+They add no new storage keys and do not modify any existing entry. All existing
+`Subscription` and `Plan` records are readable as-is; no migration is required.
+The new `SubStatus` contracttype and `BatchTooLarge` error code (14) are purely
+additive: older SDK-generated clients that do not know about them will simply
+not call the new functions. The existing `is_active` entrypoint is unaffected.
